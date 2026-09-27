@@ -285,6 +285,9 @@ and the agent installation itself are never touched.
 :::note
 The hook also emits precise `agent.hook` lifecycle events for module
 automation, including permission requests and exact turn boundaries.
+Claude notifications include `notification_type`. An `idle_prompt` notification
+preserves composer readiness established by `Stop`; prompt submission, permission
+prompts, and elicitation dialogs clear that readiness.
 :::
 
 ## Custom detection rules

@@ -3416,6 +3416,9 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(t) = flag(args, "--tool") {
                 obj.insert("tool".to_string(), json!(t));
             }
+            if let Some(notification_type) = flag(args, "--notification-type") {
+                obj.insert("notification_type".to_string(), json!(notification_type));
+            }
             ("pane.report_event".into(), with_pane(obj))
         }
         ("pane", "" | "list") => ("pane.list".into(), json!({})),
@@ -4612,6 +4615,19 @@ mod tests {
             let args = argv(raw);
             assert_eq!(command_help_request(&args), None, "{raw}");
         }
+    }
+
+    #[test]
+    fn pane_report_event_forwards_notification_type() {
+        let (method, params) = parse(&argv(
+            "luvus pane report-event 9 --agent claude --kind Notification --notification-type idle_prompt",
+        ))
+        .unwrap();
+        assert_eq!(method, "pane.report_event");
+        assert_eq!(params["pane"], "9");
+        assert_eq!(params["agent"], "claude");
+        assert_eq!(params["kind"], "Notification");
+        assert_eq!(params["notification_type"], "idle_prompt");
     }
 
     #[test]

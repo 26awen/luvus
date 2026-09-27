@@ -504,10 +504,22 @@ impl App {
             let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let message = p.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let tool = p.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let notification_type = p
+                .get("notification_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let claude_semantic_ready = if agent.eq_ignore_ascii_case("claude") {
                 match kind {
                     "Stop" => Some(true),
-                    "UserPromptSubmit" | "Notification" => Some(false),
+                    "UserPromptSubmit" => Some(false),
+                    "Notification"
+                        if matches!(
+                            notification_type,
+                            "permission_prompt" | "elicitation_dialog"
+                        ) =>
+                    {
+                        Some(false)
+                    }
                     _ => None,
                 }
             } else {
@@ -525,7 +537,7 @@ impl App {
             }
             self.emit_event(
                 "agent.hook",
-                json!({ "pane": id.0.to_string(), "agent": agent, "kind": kind, "message": message, "tool": tool }),
+                json!({ "pane": id.0.to_string(), "agent": agent, "kind": kind, "message": message, "tool": tool, "notification_type": notification_type }),
             );
             Ok(json!({"type":"ok"}))
         }

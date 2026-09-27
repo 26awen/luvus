@@ -17292,11 +17292,38 @@ fi
         let reported = api_call(
             &mut app,
             "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":"idle_prompt"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
+        assert!(
+            !app.agent_prompt_is_ready(id, false),
+            "idle notification alone does not establish composer readiness"
+        );
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
             json!({"pane":target,"agent":"claude","kind":"Stop"}),
         );
         assert_eq!(reported["result"]["type"], "ok");
         assert!(app.agent_prompt_is_ready(id, false));
         assert!(app.agent_prompt_is_ready(id, true));
+        for notification_type in ["idle_prompt", "auth_success", "", "future_notification"] {
+            let sequence = crate::ipc::api::current_sequence(&app.events);
+            let reported = api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":notification_type}),
+            );
+            assert_eq!(reported["result"]["type"], "ok");
+            let events = crate::ipc::api::replayed_events_after(&app.events, sequence);
+            let hook = events
+                .iter()
+                .find(|event| event["event"] == "agent.hook")
+                .unwrap();
+            assert_eq!(hook["data"]["notification_type"], notification_type);
+            assert!(app.agent_prompt_is_ready(id, false), "{notification_type}");
+            assert!(app.agent_prompt_is_ready(id, true), "{notification_type}");
+        }
         let (input_tx, input_rx) = mpsc::channel();
         app.panes
             .get_mut(&id)
@@ -17336,6 +17363,21 @@ fi
             !app.agent_prompt_is_ready(id, false),
             "prompt submission clears ambiguous composer readiness"
         );
+        for notification_type in ["permission_prompt", "elicitation_dialog"] {
+            api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Stop"}),
+            );
+            assert!(app.agent_prompt_is_ready(id, true));
+            api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":notification_type}),
+            );
+            assert!(!app.agent_prompt_is_ready(id, false), "{notification_type}");
+            assert!(!app.agent_prompt_is_ready(id, true), "{notification_type}");
+        }
     }
 
     // A bursty/streaming agent has long pauses *within* one turn. The debounce
