@@ -92,6 +92,17 @@ snapshot. It requests a new snapshot for created, moved, or exited terminals
 because those deliberately compact events do not repeat the full inventory
 record.
 
+`terminal.exited` reports `data.detail.exit_code` (non-negative integer or
+`null`) and `data.detail.signal` (string or `null`). A signal-terminated child
+has a `null` exit code. Known Unix signals use stable names such as `SIGKILL`;
+an unrecognized signal retains the host-provided text. If the child status cannot be recovered,
+both fields are `null`. Luvus waits briefly for both the process result and
+the final PTY output before publishing exit, with a bounded fallback if one
+notification never arrives. The subsequent `terminal.closed` has
+`data.detail.reason: "exited"` and the same status fields. An explicit close
+instead emits only `terminal.closed` with `reason: "closed"`, plus status fields
+if the child was already reaped.
+
 For a rendered live view, use `terminal.backend.observe` instead of repeatedly
 calling capture. It sends one `terminal.frame` immediately and then captures
 only when the selected terminal's existing coalesced `terminal.output_ready`

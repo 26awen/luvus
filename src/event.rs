@@ -39,8 +39,12 @@ pub enum AppEvent {
     Resize,
     /// The given pane produced output; the screen changed.
     PtyData(PaneId),
-    /// The given pane's child process exited.
+    /// Deferred PTY spawn failed before a child result was available.
     PtyExit(PaneId),
+    /// The PTY reader finished draining output (which can precede reaping).
+    PtyIoClosed(PaneId),
+    /// The child was reaped; its process status is independent of PTY EOF.
+    PtyReaped(PaneId, PtyExitStatus),
     /// Coalesced overload notification for all input sources, including replies.
     PtyInputRejected(PaneId),
     /// A deferred pane finished opening its PTY and now owns a root process and
@@ -436,4 +440,61 @@ pub enum AppEvent {
     /// Windows has no POSIX signals; the detached server stops via `server stop`.
     #[cfg_attr(not(unix), allow(dead_code))]
     Shutdown,
+}
+
+/// Portable process result retained across the PTY reader/reaper race.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PtyExitStatus {
+    pub exit_code: Option<u32>,
+    pub signal: Option<String>,
+}
+
+impl From<portable_pty::ExitStatus> for PtyExitStatus {
+    fn from(status: portable_pty::ExitStatus) -> Self {
+        let signal = status.signal().map(canonical_signal);
+        Self {
+            exit_code: signal.is_none().then(|| status.exit_code()),
+            signal,
+        }
+    }
+}
+
+fn canonical_signal(signal: &str) -> String {
+    // portable-pty exposes strsignal text rather than the signal number. Match
+    // that same platform text to stable names without guessing from an English
+    // phrase (which may be localized or differ by Unix flavor).
+    #[cfg(unix)]
+    for (name, number) in [
+        ("SIGHUP", libc::SIGHUP),
+        ("SIGINT", libc::SIGINT),
+        ("SIGQUIT", libc::SIGQUIT),
+        ("SIGILL", libc::SIGILL),
+        ("SIGTRAP", libc::SIGTRAP),
+        ("SIGABRT", libc::SIGABRT),
+        ("SIGBUS", libc::SIGBUS),
+        ("SIGFPE", libc::SIGFPE),
+        ("SIGKILL", libc::SIGKILL),
+        ("SIGUSR1", libc::SIGUSR1),
+        ("SIGSEGV", libc::SIGSEGV),
+        ("SIGUSR2", libc::SIGUSR2),
+        ("SIGPIPE", libc::SIGPIPE),
+        ("SIGALRM", libc::SIGALRM),
+        ("SIGTERM", libc::SIGTERM),
+        ("SIGCHLD", libc::SIGCHLD),
+        ("SIGCONT", libc::SIGCONT),
+        ("SIGSTOP", libc::SIGSTOP),
+        ("SIGTSTP", libc::SIGTSTP),
+        ("SIGTTIN", libc::SIGTTIN),
+        ("SIGTTOU", libc::SIGTTOU),
+    ] {
+        // SAFETY: strsignal returns either a null pointer or a NUL-terminated
+        // string for a valid platform signal constant. Read it immediately.
+        let description = unsafe { libc::strsignal(number) };
+        if !description.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(description) }.to_bytes() == signal.as_bytes()
+        {
+            return name.to_owned();
+        }
+    }
+    signal.to_owned()
 }

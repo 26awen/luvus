@@ -45,7 +45,7 @@
             "content_revision":{"type":"integer","minimum":0},
             "workspace":{"type":["integer","null"],"minimum":1},
             "tab":{"type":["integer","null"],"minimum":1},
-            "detail":{"type":"object"}
+            "detail":{"type":"object","$comment":"For terminal.exited, exit_code is a non-negative integer or null and signal is a string or null (known Unix signals use SIG names). terminal.closed includes reason (exited or closed); naturally exited terminals also include exit_code and signal."}
           },
           "required":["server_generation","terminal_id","pane_id","content_revision","workspace","tab","detail"],
           "additionalProperties":false

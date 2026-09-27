@@ -35,7 +35,7 @@ pub(crate) use input::InputSender;
 const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 
 #[cfg(test)]
-use reaper::child_poll_finished;
+use reaper::child_poll_status;
 use reaper::register_child_reaper;
 #[cfg(all(test, unix))]
 use reaper::CHILD_REAPER_STARTS;
@@ -682,7 +682,6 @@ impl Pane {
                 }
                 *master.lock().unwrap_or_else(|p| p.into_inner()) = Some(pair.master);
                 let ready_tx = tx.clone();
-                register_child_reaper(id, child, child_exited, tx.clone());
                 *terminal_runtime
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime);
@@ -690,6 +689,9 @@ impl Pane {
                     id,
                     cwd: spawned_cwd,
                 });
+                // A fast child must not publish its reaped status before the
+                // app registers this deferred pane's backend identity.
+                register_child_reaper(id, child, child_exited, tx.clone());
             })
         };
         drop(worker);
@@ -1243,7 +1245,7 @@ fn read_loop(
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
-                let _ = tx.send(AppEvent::PtyExit(id));
+                let _ = tx.send(AppEvent::PtyIoClosed(id));
                 break;
             }
             Ok(n) => {
@@ -1399,11 +1401,12 @@ mod reap_tests {
                 !remaining.is_zero(),
                 "natural child exit never woke the reaper"
             );
-            // The PTY actor may publish PtyExit before the child waiter. Keep
+            // The PTY actor may publish PtyIoClosed before the child waiter. Keep
             // waiting until the reaper sets child_exited, which is the behavior
             // this blocked-signal regression is proving.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(50))) {
-                Ok(AppEvent::PtyExit(exited)) if exited == id => {}
+                Ok(AppEvent::PtyIoClosed(exited) | AppEvent::PtyReaped(exited, _))
+                    if exited == id => {}
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(error) => panic!("natural child exit never woke the reaper: {error}"),
             }
@@ -1689,8 +1692,8 @@ mod reap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pane_env, child_poll_finished, path_with_server_binary, wrap_paste,
-        write_input_action, CommandBuilder, InputAction, PaneId,
+        apply_pane_env, child_poll_status, path_with_server_binary, wrap_paste, write_input_action,
+        CommandBuilder, InputAction, PaneId,
     };
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -1742,13 +1745,13 @@ mod tests {
 
     #[test]
     fn reaper_retries_child_poll_errors() {
-        assert!(!child_poll_finished(Ok(None)));
-        assert!(!child_poll_finished(Err(std::io::Error::other(
-            "temporary poll failure"
-        ))));
-        assert!(child_poll_finished(Ok(Some(
-            portable_pty::ExitStatus::with_exit_code(0)
-        ))));
+        assert!(child_poll_status(Ok(None)).is_none());
+        assert!(child_poll_status(Err(std::io::Error::other("temporary poll failure"))).is_none());
+        assert_eq!(
+            child_poll_status(Ok(Some(portable_pty::ExitStatus::with_exit_code(0))))
+                .map(|status| status.exit_code()),
+            Some(0)
+        );
     }
 
     #[test]

@@ -145,6 +145,14 @@ impl App {
         if let Some(exp) = self.bar.notifications.iter().map(|n| n.expires_at).min() {
             consider(exp, true);
         }
+        if let Some(exp) = self
+            .pending_pty_exits
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+        {
+            consider(exp, true);
+        }
 
         if self.detection_work_pending(now) {
             consider(self.last_detect_at + DETECTION_INTERVAL, true);
@@ -411,7 +419,8 @@ impl App {
 
     pub(crate) fn detect_tick_with(&mut self, now: Instant, clients_attached: bool) -> bool {
         self.runtime_clients_attached = clients_attached;
-        let repaired_location = self.repair_active_location();
+        let exited = self.tick_pty_exits(now);
+        let repaired_location = self.repair_active_location() || exited;
         self.schedule_config_save(now);
         self.schedule_automation_save(now);
         // No node open (docs/43 §3.3 — the session was closed). Closing the last

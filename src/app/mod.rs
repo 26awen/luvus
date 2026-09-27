@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::detect;
 use crate::event::AppEvent;
+use crate::event::PtyExitStatus;
 use crate::ids::PaneId;
 use crate::ipc::api::{self, ApiRequest, EventBus};
 use crate::layout::{Axis, Dir, TileLayout};
@@ -2349,8 +2350,20 @@ impl PendingWorktreeDelete {
     }
 }
 
+const PTY_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+struct PendingPtyExit {
+    io_closed: bool,
+    status: Option<PtyExitStatus>,
+    deadline: Instant,
+}
+
 pub struct App {
     pub panes: HashMap<PaneId, Pane>,
+    /// A short, event-driven rendezvous between PTY EOF and process reaping.
+    pending_pty_exits: HashMap<PaneId, PendingPtyExit>,
+    /// Set only while closing a naturally exited pane, for lifecycle metadata.
+    finalizing_pty_exit: Option<PaneId>,
     /// One random value for this server lifetime. Harness runtimes from an old
     /// server fail closed even if a process-local pane route is later reused.
     pub(crate) backend_server_generation: String,
@@ -3191,6 +3204,8 @@ impl App {
         status.insert(id, PaneStatus::new(command));
 
         let mut app = App {
+            pending_pty_exits: HashMap::new(),
+            finalizing_pty_exit: None,
             panes,
             backend_server_generation,
             backend_terminal_index,
@@ -3901,6 +3916,8 @@ impl App {
             .collect();
 
         let mut app = App {
+            pending_pty_exits: HashMap::new(),
+            finalizing_pty_exit: None,
             panes,
             backend_server_generation,
             backend_terminal_index,
@@ -8810,14 +8827,102 @@ impl App {
         self.show_toast(msg);
     }
 
-    /// Tear down the per-leaf runtime state that every close path shares: the PTY
-    /// pane **or** file view (docs/38), its detection status, module-pane tracking,
-    /// and any bookkeeping that must not be left pointing at a dead id. Does not
-    /// touch the layout/tab — the caller owns that. Centralized so a new close
-    /// path can never again forget one map (e.g. leaking a `views` entry, which
-    /// made a closed file un-reopenable).
+    /// Wait briefly for both OS child status and drained PTY output, regardless
+    /// of which notification arrives first. The existing runtime deadline wakes
+    /// a quiet server if either source fails to report.
+    fn note_pty_exit(
+        &mut self,
+        id: PaneId,
+        io_closed: bool,
+        status: Option<PtyExitStatus>,
+    ) -> bool {
+        if !self.panes.contains_key(&id) {
+            return false;
+        }
+        let pending = self
+            .pending_pty_exits
+            .entry(id)
+            .or_insert_with(|| PendingPtyExit {
+                io_closed: false,
+                status: None,
+                deadline: Instant::now() + PTY_EXIT_GRACE,
+            });
+        pending.io_closed |= io_closed;
+        if let Some(status) = status {
+            pending.status = Some(status);
+        }
+        if pending.io_closed && pending.status.is_some() {
+            self.finish_pty_exit(id);
+            return true;
+        }
+        false
+    }
+
+    fn finish_pty_exit(&mut self, id: PaneId) {
+        let status = self
+            .pending_pty_exits
+            .get(&id)
+            .and_then(|pending| pending.status.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let class = if status.signal.is_some() {
+            crate::logging::ExitClass::Signaled
+        } else if status.exit_code.is_some() {
+            crate::logging::ExitClass::Exited
+        } else {
+            crate::logging::ExitClass::Unknown
+        };
+        crate::logging::event(
+            crate::logging::EventKind::PtyExit,
+            &[
+                crate::logging::Field::PaneId(u64::from(id.0)),
+                crate::logging::Field::ExitClass(class),
+            ],
+        );
+        self.emit_backend_terminal_event(
+            id,
+            "terminal.exited",
+            json!({"exit_code":status.exit_code,"signal":status.signal}),
+        );
+        self.finalizing_pty_exit = Some(id);
+        self.close_pane(id);
+        self.finalizing_pty_exit = None;
+    }
+
+    fn tick_pty_exits(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_pty_exits
+            .iter()
+            .filter_map(|(&id, pending)| (now >= pending.deadline).then_some(id))
+            .collect::<Vec<_>>();
+        for id in &due {
+            self.finish_pty_exit(*id);
+        }
+        !due.is_empty()
+    }
+
+    /// Tear down the per-leaf runtime state shared by every close path.
     fn drop_leaf_runtime(&mut self, id: PaneId) {
-        self.emit_backend_terminal_event(id, "terminal.closed", serde_json::json!({}));
+        let detail = if self.finalizing_pty_exit == Some(id) {
+            let status = self
+                .pending_pty_exits
+                .get(&id)
+                .and_then(|pending| pending.status.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            json!({"reason":"exited","exit_code":status.exit_code,"signal":status.signal})
+        } else if let Some(status) = self
+            .pending_pty_exits
+            .get(&id)
+            .and_then(|pending| pending.status.as_ref())
+        {
+            json!({"reason":"closed","exit_code":status.exit_code,"signal":status.signal})
+        } else {
+            json!({"reason":"closed"})
+        };
+        self.emit_backend_terminal_event(id, "terminal.closed", detail);
+        self.pending_pty_exits.remove(&id);
+        self.runtime_cwd_dirty_panes.remove(&id);
         self.backend_terminal_index.retain(|_, pane| *pane != id);
         self.backend_labels.remove(&id);
         self.backend_published_revisions.remove(&id);
