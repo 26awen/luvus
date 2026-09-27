@@ -1185,11 +1185,19 @@ pub(crate) fn prompt_requires_positive_evidence(agent: &str) -> bool {
 }
 
 /// Probe composer geometry only for agents requiring positive evidence.
-pub(crate) fn live_composer_ready(agent: &str, engine: &dyn VtEngine) -> Option<bool> {
+pub(crate) fn live_composer_ready(
+    agent: &str,
+    engine: &dyn VtEngine,
+    claude_semantic_ready: bool,
+) -> Option<bool> {
     if agent.eq_ignore_ascii_case("codex") {
         Some(engine.codex_composer_region().is_some())
     } else if agent.eq_ignore_ascii_case("claude") {
-        Some(engine.claude_composer_ready())
+        Some(match engine.claude_composer_evidence() {
+            crate::terminal::vt::ClaudeComposerEvidence::Absent => false,
+            crate::terminal::vt::ClaudeComposerEvidence::Ready => true,
+            crate::terminal::vt::ClaudeComposerEvidence::Ambiguous => claude_semantic_ready,
+        })
     } else {
         None
     }

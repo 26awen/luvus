@@ -1908,6 +1908,9 @@ pub struct PaneStatus {
     /// Raw, non-debounced prompt-surface evidence. Prompt APIs consult this
     /// separately from the presentation state's quiet-dwell hysteresis.
     prompt_evidence: detect::PromptEvidence,
+    /// Claude's Stop hook confirms that an otherwise ambiguous rail layout is
+    /// the current input composer. Prompt submission and notifications clear it.
+    claude_prompt_semantic_ready: bool,
     /// A server-owned launch whose CLI needs a proven composer before prompt
     /// input. Existing panes retain the legacy permissive fallback when the
     /// detector has neither ready nor blocked evidence.
@@ -1947,6 +1950,7 @@ impl PaneStatus {
             force_detect: true,
             blocked_hint: None,
             prompt_evidence: detect::PromptEvidence::Unknown,
+            claude_prompt_semantic_ready: false,
             prompt_evidence_required: false,
             identity_source: "command_fallback",
             state_source: "no_positive_state_evidence",
@@ -17262,13 +17266,35 @@ fi
         assert_eq!(prompted["error"]["code"], "agent_not_ready");
 
         let rail = "─".repeat(40);
+        // A completed old composer followed by an unrelated interaction has
+        // the same rail geometry as divider text inside a live prompt. Without
+        // lifecycle evidence, that ambiguous screen must remain closed.
         {
             let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
             engine.advance(
-                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[18;1H{rail}\x1b[36;1H{rail}\x1b[24;3H")
+                format!("\x1b[2J\x1b[1;1H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[32;1HUnrelated interaction\x1b[34;1H{rail}\x1b[32;8H")
                     .as_bytes(),
             );
         }
+        assert!(!app.agent_prompt_is_ready(id, false));
+
+        // A real multiline composer may contain a full-width divider directly
+        // after the prompt. The Stop hook identifies it as the current input
+        // region without relying on visible-text heuristics.
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(
+                format!("\x1b[2J\x1b[1;1H{rail}\x1b[2;1H❯\u{a0} input\x1b[3;1H{rail}\x1b[5;1Hmore input\x1b[36;1H{rail}\x1b[24;3H")
+                    .as_bytes(),
+            );
+        }
+        assert!(!app.agent_prompt_is_ready(id, false));
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"Stop"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
         assert!(app.agent_prompt_is_ready(id, false));
         assert!(app.agent_prompt_is_ready(id, true));
         let (input_tx, input_rx) = mpsc::channel();
@@ -17299,6 +17325,17 @@ fi
             input_rx.try_recv().unwrap(),
             crate::terminal::pty::InputAction::Submit { .. }
         ));
+
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"UserPromptSubmit"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
+        assert!(
+            !app.agent_prompt_is_ready(id, false),
+            "prompt submission clears ambiguous composer readiness"
+        );
     }
 
     // A bursty/streaming agent has long pauses *within* one turn. The debounce

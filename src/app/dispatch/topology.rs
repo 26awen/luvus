@@ -504,6 +504,25 @@ impl App {
             let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let message = p.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let tool = p.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            let claude_semantic_ready = if agent.eq_ignore_ascii_case("claude") {
+                match kind {
+                    "Stop" => Some(true),
+                    "UserPromptSubmit" | "Notification" => Some(false),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(ready) = claude_semantic_ready {
+                if let Some(status) = self.status.get_mut(&id) {
+                    status.claude_prompt_semantic_ready = ready;
+                    status.force_detect = true;
+                    if !ready {
+                        status.prompt_evidence = detect::PromptEvidence::Unknown;
+                        status.last_detect_generation = None;
+                    }
+                }
+            }
             self.emit_event(
                 "agent.hook",
                 json!({ "pane": id.0.to_string(), "agent": agent, "kind": kind, "message": message, "tool": tool }),

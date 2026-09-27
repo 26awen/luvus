@@ -40,7 +40,7 @@ try:
     d=json.load(sys.stdin); print(d.get("hook_event_name") or d.get("event") or "")
 except Exception: print("")' 2>/dev/null)"
 case "$evt" in
-  Notification|Stop|SubagentStop)
+  Notification|Stop|SubagentStop|UserPromptSubmit)
     msg="$(printf '%s' "$input" | python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin); print((d.get("message") or "")[:200])
@@ -469,6 +469,17 @@ mod tests {
         // Only one luvus entry despite installing twice.
         let count = groups.iter().filter(|g| group_mentions_luvus(g)).count();
         assert_eq!(count, 1);
+        for event in ["Notification", "Stop", "UserPromptSubmit"] {
+            let groups = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                groups
+                    .iter()
+                    .filter(|group| group_mentions_luvus(group))
+                    .count(),
+                1,
+                "one Luvus {event} hook remains after an idempotent reinstall"
+            );
+        }
         assert!(is_installed("claude"));
 
         let mut incomplete = settings;

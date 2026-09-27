@@ -533,7 +533,9 @@ impl App {
         let evidence = if raw == detect::PromptEvidence::Blocked {
             raw
         } else if positive_evidence_required {
-            if detect::live_composer_ready(agent, &*engine) == Some(true) {
+            if detect::live_composer_ready(agent, &*engine, status.claude_prompt_semantic_ready)
+                == Some(true)
+            {
                 detect::PromptEvidence::Ready
             } else {
                 detect::PromptEvidence::Unknown

@@ -610,11 +610,17 @@ impl App {
             } else {
                 None
             };
-            let (last_generation, force_detect) = self
+            let (last_generation, force_detect, claude_semantic_ready) = self
                 .status
                 .get(&id)
-                .map(|s| (s.last_detect_generation, s.force_detect))
-                .unwrap_or((None, true));
+                .map(|s| {
+                    (
+                        s.last_detect_generation,
+                        s.force_detect,
+                        s.claude_prompt_semantic_ready,
+                    )
+                })
+                .unwrap_or((None, true, false));
             let inspected = if report.is_some() {
                 // An explicit lease is the state authority. Keep the cached
                 // screen untouched and avoid a needless VT lock/extraction.
@@ -630,8 +636,9 @@ impl App {
                                 non_empty_rows,
                                 probe_arc_studio,
                             );
-                            let composer_ready = composer_agent
-                                .and_then(|agent| detect::live_composer_ready(agent, &*engine));
+                            let composer_ready = composer_agent.and_then(|agent| {
+                                detect::live_composer_ready(agent, &*engine, claude_semantic_ready)
+                            });
                             Some((
                                 generation,
                                 engine.title().map(Arc::<str>::from),
@@ -771,6 +778,9 @@ impl App {
                     || s.agent_session.is_some()
                     || s.agent_report.is_some();
                 s.agent = detected;
+                if agent_changed && !s.agent.eq_ignore_ascii_case("claude") {
+                    s.claude_prompt_semantic_ready = false;
+                }
                 let composer_ready = composer_agent
                     .filter(|agent| agent.eq_ignore_ascii_case(&s.agent))
                     .and(inspected_composer_ready);
