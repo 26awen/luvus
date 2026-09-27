@@ -4286,6 +4286,8 @@ mod tests {
     /// results or their hit rectangles.
     #[test]
     fn files_filter_remains_visible_while_the_root_listing_loads() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
         let _env = crate::persist::test_env("files-filter-during-root-loading");
         let root =
             std::env::temp_dir().join(format!("luvus-filter-root-loading-{}", std::process::id()));
@@ -4309,7 +4311,7 @@ mod tests {
             instance: filter.instance,
             generation: filter.generation,
             rows: vec![crate::files::VisibleRow {
-                path: match_path,
+                path: match_path.clone(),
                 name: "match.rs".into(),
                 depth: 0,
                 is_dir: false,
@@ -4328,6 +4330,23 @@ mod tests {
             app.file_tree_rects.len(),
             1,
             "the indexed match remains clickable"
+        );
+        let rect = app.file_tree_rects[0].1;
+        assert!(app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 3,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        })));
+        let preview = app.layout().focus;
+        assert_eq!(
+            shown(&app, preview),
+            match_path,
+            "clicking the filtered row opens the match while the root is pending"
+        );
+        assert!(
+            app.preview_views.contains(&preview),
+            "the default click route opened the reusable preview"
         );
 
         let _ = std::fs::remove_dir_all(&root);
