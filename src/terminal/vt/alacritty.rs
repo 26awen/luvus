@@ -580,16 +580,12 @@ impl VtEngine for AlacrittyEngine {
         let row_has_prompt = |row: usize| {
             (0..cols.min(3)).any(|col| matches!(grid[Line(row as i32)][Column(col)].c, '❯' | '>'))
         };
-        let Some(prompt) = (cursor.saturating_sub(16)..=cursor)
-            .rev()
-            .find(|&row| row_has_prompt(row))
-        else {
+        // Bound the search by the visible grid, not an arbitrary input height.
+        // The nearest upper rail keeps an old composer above the cursor out.
+        let Some(top) = (0..cursor).rev().find(|&row| row_is_rail(row)) else {
             return false;
         };
-        let Some(top) = prompt.checked_sub(1) else {
-            return false;
-        };
-        row_is_rail(top) && ((cursor + 1)..=(cursor + 16).min(rows - 1)).any(row_is_rail)
+        row_has_prompt(top + 1) && ((cursor + 1)..rows).any(row_is_rail)
     }
 
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
@@ -2703,6 +2699,20 @@ mod tests {
 
         e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[7;1HTrust this folder?\x1b[7;2H").as_bytes());
         assert!(!e.claude_composer_ready(), "old transcript is not input");
+    }
+
+    #[test]
+    fn claude_composer_accepts_tall_multiline_input() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 40, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ input\x1b[38;1H{rail}").as_bytes());
+        for cursor_row in [2, 18, 19, 35] {
+            e.advance(format!("\x1b[{cursor_row};3H").as_bytes());
+            assert!(e.claude_composer_ready(), "cursor row {cursor_row}");
+        }
+        e.advance(b"\x1b[39;1Hother screen");
+        assert!(!e.claude_composer_ready(), "cursor below composer");
     }
 
     #[test]

@@ -479,13 +479,16 @@ impl App {
         let Some(status) = self.status.get(&id) else {
             return !strict;
         };
-        let positive_evidence_required = status.prompt_evidence_required
-            || detect::prompt_requires_positive_evidence(&status.agent)
-            || status
-                .agent_session
-                .as_ref()
-                .is_some_and(|session| detect::prompt_requires_positive_evidence(&session.agent));
-        let agent = if detect::prompt_requires_positive_evidence(&status.agent) {
+        let report = status
+            .agent_report
+            .as_ref()
+            .filter(|report| Instant::now() < report.expires_at);
+        if report.is_some_and(|report| report.state == State::Blocked) {
+            return false;
+        }
+        let resolved_agent = self.manifests.is_agent(&status.agent)
+            || report.is_some_and(|report| report.agent == status.agent);
+        let agent = if resolved_agent {
             status.agent.as_str()
         } else {
             status
@@ -494,6 +497,8 @@ impl App {
                 .map(|session| session.agent.as_str())
                 .unwrap_or(&status.agent)
         };
+        let positive_evidence_required = detect::prompt_requires_positive_evidence(agent)
+            || (!resolved_agent && status.prompt_evidence_required);
         let admits = |evidence| match evidence {
             detect::PromptEvidence::Ready => true,
             detect::PromptEvidence::Blocked => false,

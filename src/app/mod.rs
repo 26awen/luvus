@@ -17222,7 +17222,7 @@ fi
     fn claude_prompt_methods_reject_theme_picker_but_accept_live_composer() {
         let _env = crate::persist::test_env("claude-prompt-readiness");
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(40, 10, tx).unwrap();
+        let mut app = App::new(40, 40, tx).unwrap();
         let id = app.layout().focus;
         app.status.get_mut(&id).unwrap().agent = "claude".into();
         {
@@ -17265,7 +17265,7 @@ fi
         {
             let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
             engine.advance(
-                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[8;1H{rail}\x1b[7;3H")
+                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[36;1H{rail}\x1b[24;3H")
                     .as_bytes(),
             );
         }

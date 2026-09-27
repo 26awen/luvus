@@ -481,6 +481,14 @@ impl App {
                 let changed = status.state != state || status.agent != agent;
                 status.agent = agent.to_string();
                 status.state = state;
+                // Reports can change admission without any new terminal bytes.
+                status.prompt_evidence = if state == State::Blocked {
+                    detect::PromptEvidence::Blocked
+                } else {
+                    detect::PromptEvidence::Unknown
+                };
+                status.force_detect = true;
+                status.last_detect_generation = None;
                 status.candidate = state;
                 status.candidate_since = now;
                 status.prev_working = state == State::Working;
