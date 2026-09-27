@@ -165,7 +165,17 @@ impl App {
                     "agent send text must not be empty".to_string(),
                 ));
             }
-            if !self.agent_prompt_is_ready(id) {
+            let strict = match p.get("strict") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "strict must be a boolean".to_string(),
+                    ));
+                }
+            };
+            if !self.agent_prompt_is_ready(id, strict) {
                 return Err(super::agent_workflow::agent_prompt_not_ready_error());
             }
             let pane = self.panes.get(&id).ok_or_else(|| {

@@ -17218,6 +17218,89 @@ fi
         );
     }
 
+    #[test]
+    fn claude_prompt_methods_reject_theme_picker_but_accept_live_composer() {
+        let _env = crate::persist::test_env("claude-prompt-readiness");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(40, 10, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "claude".into();
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(b"\x1b[2J\x1b[HChoose the text style that looks best\x1b[7;1H\xe2\x9d\xaf 2. Dark mode\x1b[7;4H");
+        }
+        {
+            let status = app.status.get_mut(&id).unwrap();
+            status.prompt_evidence = crate::detect::PromptEvidence::Ready;
+            status.last_resize = Some(Instant::now());
+            status.force_detect = true;
+        }
+        app.detection_dirty.insert(id);
+        app.detect_tick(Instant::now());
+        assert_eq!(
+            app.status.get(&id).unwrap().prompt_evidence,
+            crate::detect::PromptEvidence::Unknown,
+        );
+        assert!(!app.agent_prompt_is_ready(id, false));
+
+        let target = id.0.to_string();
+        let sent = api_call(
+            &mut app,
+            "agent.send",
+            json!({"target":target,"text":"hello"}),
+        );
+        assert_eq!(sent["error"]["code"], "agent_not_ready");
+
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "test".into(),
+            json!({"target":target,"text":"hello"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["error"]["code"], "agent_not_ready");
+
+        let rail = "─".repeat(40);
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(
+                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[8;1H{rail}\x1b[7;3H")
+                    .as_bytes(),
+            );
+        }
+        assert!(app.agent_prompt_is_ready(id, false));
+        assert!(app.agent_prompt_is_ready(id, true));
+        let (input_tx, input_rx) = mpsc::channel();
+        app.panes
+            .get_mut(&id)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+        let sent = api_call(
+            &mut app,
+            "agent.send",
+            json!({"target":target,"text":"hello","strict":true}),
+        );
+        assert_eq!(sent["result"]["pane"], id.0.to_string());
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            crate::terminal::pty::InputAction::Submit { .. }
+        ));
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "strict-ready".into(),
+            json!({"target":target,"text":"hello again","strict":true}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["result"]["submitted"], true);
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            crate::terminal::pty::InputAction::Submit { .. }
+        ));
+    }
+
     // A bursty/streaming agent has long pauses *within* one turn. The debounce
     // (QUIET_DWELL) must hold the status at Working through those pauses and
     // only commit Done — and chime — on sustained quiet, once per real finish.

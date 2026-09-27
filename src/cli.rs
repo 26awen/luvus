@@ -160,9 +160,9 @@ panes / agents:
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
   agent name <name>          alias the current agent, same as pane name (--clear to drop)
-  agent prompt <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent prompt <target> <text> [--strict] [--wait] [--until STATE] [--timeout <s>]
                              atomically prompt and optionally wait (send is an alias)
-  agent send <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent send <target> <text> [--strict] [--wait] [--until STATE] [--timeout <s>]
                              compatibility alias for agent prompt
   agent keys <target> <key>...   send control keys (enter, esc, ctrl+c, up, …)
   agent read <target> [--lines N] [--source visible|recent]   print an agent's output
@@ -2193,15 +2193,16 @@ fn skill_cmd(rest: &[String], context: crate::i18n::cli::Context) -> Result<i32>
     }
 }
 
-/// `luvus agent prompt <target> <text…> [--wait] [--until STATE] [--timeout S]`
+/// `luvus agent prompt <target> <text…> [--strict] [--wait] [--until STATE] [--timeout S]`
 /// submits and waits as one server-owned operation. `agent send` remains a
 /// compatibility alias.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent prompt <target> <text> [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent prompt <target> <text> [--strict] [--wait] [--until STATE] [--timeout S]")
     })?;
     let mut text_parts = Vec::new();
     let mut wait = false;
+    let mut strict = false;
     let mut until = Vec::new();
     let mut timeout = None;
     let mut positional_only = false;
@@ -2220,6 +2221,10 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
             }
             "--wait" => {
                 wait = true;
+                index += 1;
+            }
+            "--strict" => {
+                strict = true;
                 index += 1;
             }
             "--until" => {
@@ -2256,6 +2261,9 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
     params.insert("target".into(), json!(target));
     params.insert("text".into(), json!(text));
     params.insert("wait".into(), json!(wait));
+    if strict {
+        params.insert("strict".into(), json!(true));
+    }
     if !until.is_empty() {
         params.insert("until".into(), json!(until));
     }
@@ -5605,6 +5613,8 @@ mod tests {
             ("luvus agent prompt 7 review", json!({"target":"7","text":"review","wait":false})),
             ("luvus agent send reviewer review this", json!({"target":"reviewer","text":"review this","wait":false})),
             ("luvus agent prompt codex review --wait", json!({"target":"codex","text":"review","wait":true})),
+            ("luvus agent prompt claude --strict review", json!({"target":"claude","text":"review","wait":false,"strict":true})),
+            ("luvus agent send reviewer --strict review this", json!({"target":"reviewer","text":"review this","wait":false,"strict":true})),
             ("luvus agent send 7 review --wait --until done --timeout 0.5", json!({"target":"7","text":"review","wait":true,"until":["done"],"timeout_s":0.5})),
             ("luvus agent prompt 7 --wait --until idle --until working --until blocked --until done review --timeout 3600", json!({"target":"7","text":"review","wait":true,"until":["idle","working","blocked","done"],"timeout_s":3600.0})),
             ("luvus agent send 7 --wait --until idle --until idle --timeout 0 review", json!({"target":"7","text":"review","wait":true,"until":["idle","idle"],"timeout_s":0.0})),

@@ -1303,6 +1303,11 @@ fn agent_prompt_and_shell_command_do_not_leak_across_segments() {
     app.new_tab();
     let shell = app.layout().focus;
     app.status.get_mut(&agent).unwrap().agent = "claude".into();
+    let rail = "─".repeat(80);
+    app.panes[&agent].engine.lock().unwrap().advance(
+        format!("\x1b[2J\x1b[H\x1b[20;1H{rail}\x1b[21;1H❯\u{a0} \x1b[22;1H{rail}\x1b[21;3H")
+            .as_bytes(),
+    );
     let (agent_tx, agent_rx) = std::sync::mpsc::channel();
     let (shell_tx, shell_rx) = std::sync::mpsc::channel();
     app.panes

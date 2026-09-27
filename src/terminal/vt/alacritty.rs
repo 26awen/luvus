@@ -549,6 +549,49 @@ impl VtEngine for AlacrittyEngine {
         })
     }
 
+    fn claude_composer_ready(&self) -> bool {
+        let grid = self.term.grid();
+        if grid.display_offset() != 0 {
+            return false;
+        }
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        if rows < 3 || cols < 8 {
+            return false;
+        }
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        if cursor >= rows {
+            return false;
+        }
+
+        // Claude's input is between two solid full-width rails. Its theme
+        // picker also has a selected `❯` item, but not this live geometry.
+        let row_is_rail = |row: usize| {
+            let mut rails = 0;
+            for col in 0..cols {
+                match grid[Line(row as i32)][Column(col)].c {
+                    '─' => rails += 1,
+                    ' ' | '\0' => {}
+                    _ => return false,
+                }
+            }
+            rails >= cols - 2
+        };
+        let row_has_prompt = |row: usize| {
+            (0..cols.min(3)).any(|col| matches!(grid[Line(row as i32)][Column(col)].c, '❯' | '>'))
+        };
+        let Some(prompt) = (cursor.saturating_sub(16)..=cursor)
+            .rev()
+            .find(|&row| row_has_prompt(row))
+        else {
+            return false;
+        };
+        let Some(top) = prompt.checked_sub(1) else {
+            return false;
+        };
+        row_is_rail(top) && ((cursor + 1)..=(cursor + 16).min(rows - 1)).any(row_is_rail)
+    }
+
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
         // `display_iter` walks the *displayed* region, whose lines are *negative*
         // once scrolled into history (it starts at `Line(-display_offset)`).
@@ -2641,6 +2684,25 @@ mod tests {
         // not be restyled as the active composer.
         e.advance(b"\x1b[1;1Htranscript\x1b[2;1H");
         assert_eq!(e.codex_composer_region(), None);
+    }
+
+    #[test]
+    fn claude_composer_requires_live_input_between_solid_rails() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+
+        // Claude Code 2.1.283 hides the terminal cursor while drawing its own.
+        e.advance(
+            format!("\x1b[?25l\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[8;1H{rail}\x1b[7;3H").as_bytes(),
+        );
+        assert!(e.claude_composer_ready());
+
+        e.advance("\x1b[2J\x1b[HChoose the text style that looks best\x1b[7;1H❯ 2. Dark mode\x1b[8;1H╌╌╌╌╌╌╌╌╌╌\x1b[7;4H".as_bytes());
+        assert!(!e.claude_composer_ready(), "theme selection is not input");
+
+        e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[7;1HTrust this folder?\x1b[7;2H").as_bytes());
+        assert!(!e.claude_composer_ready(), "old transcript is not input");
     }
 
     #[test]

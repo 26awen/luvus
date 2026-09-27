@@ -856,7 +856,7 @@ impl App {
                     id.0
                 ));
             }
-            if !self.agent_prompt_is_ready(id) {
+            if !self.agent_prompt_is_ready(id, false) {
                 return Err(format!("p{} has no ready agent input yet", id.0));
             }
             if state == Some(crate::ui::theme::State::Working) {
