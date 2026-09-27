@@ -515,7 +515,7 @@ impl App {
                     "Notification"
                         if matches!(
                             notification_type,
-                            "permission_prompt" | "elicitation_dialog"
+                            "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog"
                         ) =>
                     {
                         Some(false)

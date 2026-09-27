@@ -17363,7 +17363,11 @@ fi
             !app.agent_prompt_is_ready(id, false),
             "prompt submission clears ambiguous composer readiness"
         );
-        for notification_type in ["permission_prompt", "elicitation_dialog"] {
+        for notification_type in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+        ] {
             api_call(
                 &mut app,
                 "pane.report_event",
