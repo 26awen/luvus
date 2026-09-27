@@ -585,27 +585,21 @@ impl VtEngine for AlacrittyEngine {
         // followed by Claude's prompt marker. Continue past divider text.
         let Some(top) = (0..cursor)
             .rev()
-            .find(|&row| row_has_prompt(row + 1) && row_is_rail(row))
+            .find(|&top| row_has_prompt(top + 1) && row_is_rail(top))
         else {
             return false;
         };
-        if !((cursor + 1)..rows).any(row_is_rail) {
+        let prompt = top + 1;
+
+        // A rail directly below the old prompt closes that compact composer.
+        // Do not pair its stale upper half with an unrelated rail below the
+        // current cursor. Rails later in a live multiline input may be text the
+        // user typed, so only this adjacent closing geometry is conclusive.
+        if prompt + 1 < cursor && row_is_rail(prompt + 1) {
             return false;
         }
 
-        // A rail between the prompt and cursor closes that input unless text
-        // immediately below it shows a continued, typed input section.
-        ((top + 2)..=cursor).all(|row| {
-            !row_is_rail(row)
-                || (row > top + 2
-                    && row < cursor
-                    && (0..cols).any(|col| {
-                        !matches!(
-                            grid[Line((row + 1) as i32)][Column(col)].c,
-                            '─' | ' ' | '\0'
-                        )
-                    }))
-        })
+        ((cursor + 1)..rows).any(row_is_rail)
     }
 
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
@@ -2735,23 +2729,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_composer_rejects_disconnected_rails() {
-        let (tx, _rx) = channel();
-        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
-        let rail = "─".repeat(40);
-
-        // The old composer has already ended above the cursor. A separate
-        // rail farther down must not complete it into a live input region.
-        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ old input\x1b[4;1H{rail}\x1b[6;1Hunrelated text\x1b[8;1H{rail}\x1b[6;15H").as_bytes());
-        assert!(!e.claude_composer_ready());
-
-        // A rail directly after the old prompt is its lower edge, even when
-        // unrelated content begins on the next row.
-        e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old input\x1b[3;1H{rail}\x1b[4;1Hunrelated text\x1b[8;1H{rail}\x1b[4;15H").as_bytes());
-        assert!(!e.claude_composer_ready());
-    }
-
-    #[test]
     fn claude_composer_accepts_tall_multiline_input() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(40, 40, tx, budget_for_rows(40, 2_000));
@@ -2763,6 +2740,24 @@ mod tests {
         }
         e.advance(b"\x1b[39;1Hother screen");
         assert!(!e.claude_composer_ready(), "cursor below composer");
+    }
+
+    #[test]
+    fn claude_composer_rejects_disconnected_stale_prompt_and_rail() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 40, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+
+        // Rows 1-3 are a completed old composer. The cursor and later rail
+        // belong to another interaction and must not revive that stale prompt.
+        e.advance(
+            format!(
+                "\x1b[1;1H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[32;1HUnrelated interaction\x1b[34;1H{rail}\x1b[32;8H"
+            )
+            .as_bytes(),
+        );
+
+        assert!(!e.claude_composer_ready());
     }
 
     #[test]
