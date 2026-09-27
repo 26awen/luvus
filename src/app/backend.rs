@@ -553,6 +553,58 @@ impl App {
         }
     }
 
+    pub(super) fn workspace_delete_pending(&self, workspace_index: usize) -> bool {
+        let workspace = &self.workspaces[workspace_index];
+        self.worktree_deletes_inflight.values().any(|pending| {
+            pending.contains(&workspace.cwd, None)
+                || workspace
+                    .worktree
+                    .as_ref()
+                    .and_then(|membership| membership.directory_identity)
+                    == Some(pending.identity)
+        })
+    }
+
+    pub(super) fn backend_create_preflight(
+        &self,
+        cwd: &Path,
+        placement: &backend::CreatePlacement,
+    ) -> Result<(), BackendError> {
+        let deleting = || {
+            BackendError::mutation(
+                "create_failed",
+                "worktree deletion is still pending",
+                DispatchEvidence::NotStarted,
+            )
+        };
+        if self.worktree_delete_pending_for(cwd, Some(cwd)) {
+            return Err(deleting());
+        }
+        if let backend::CreatePlacement::Sibling(locator) = placement {
+            let params = json!({
+                "server_generation":locator.server_generation,
+                "terminal_id":locator.terminal_id,
+                "pane_id":locator.pane_id,
+            });
+            let target = self
+                .resolve_backend_runtime(&params, true)
+                .map_err(|error| {
+                    BackendError::mutation(error.code, error.message, DispatchEvidence::NotStarted)
+                })?;
+            let (workspace_index, _) = self.pane_location(target).ok_or_else(|| {
+                BackendError::mutation(
+                    "stale_route",
+                    "sibling terminal no longer has a pane location",
+                    DispatchEvidence::NotStarted,
+                )
+            })?;
+            if self.workspace_delete_pending(workspace_index) {
+                return Err(deleting());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn start_backend_create(&mut self, req: ApiRequest) {
         let parsed = (|| -> Result<_, BackendError> {
             reject_mutation_fields(
@@ -728,45 +780,71 @@ impl App {
         let appearance = self.pane_appearance;
         let app_tx = self.app_tx.clone();
         let event_tx = self.app_tx.clone();
+        let pending_deletes = self
+            .worktree_deletes_inflight
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         std::thread::spawn(move || {
             let canonical = std::fs::canonicalize(&cwd)
                 .map_err(|_| "cwd does not exist or cannot be resolved".to_string())
-                .and_then(|cwd| {
-                    if cwd.is_dir() {
-                        Ok(cwd)
-                    } else {
+                .and_then(|resolved| {
+                    if !resolved.is_dir() {
                         Err("cwd is not a directory".to_string())
+                    } else if pending_deletes
+                        .iter()
+                        .any(|pending| pending.contains(&cwd, Some(&resolved)))
+                    {
+                        Err("worktree deletion is still pending".to_string())
+                    } else {
+                        Ok(resolved)
                     }
                 });
             let (resolved_cwd, branch, worktree, result) = match canonical {
                 Ok(resolved_cwd) => {
                     let branch = git_branch(&resolved_cwd);
                     let worktree = worktree_membership(&resolved_cwd);
-                    let result = match command.as_ref() {
-                        Some(command) => crate::terminal::pty::Pane::spawn_command(
-                            pane_id,
-                            80,
-                            24,
-                            resolved_cwd.clone(),
-                            app_tx,
-                            command,
-                            &[],
-                            history_budget,
-                            appearance,
-                        ),
-                        None => crate::terminal::pty::Pane::spawn(
-                            pane_id,
-                            80,
-                            24,
-                            resolved_cwd.clone(),
-                            app_tx,
-                            None,
-                            &shell,
-                            history_budget,
-                            appearance,
-                        ),
-                    }
-                    .map_err(|_| "PTY or root process failed to start".to_string());
+                    let (preflight_tx, preflight_rx) = std::sync::mpsc::channel();
+                    let preflight = event_tx
+                        .send(AppEvent::BackendCreatePreflight {
+                            cwd: resolved_cwd.clone(),
+                            placement: commit.placement.clone(),
+                            reply: preflight_tx,
+                        })
+                        .map_err(|_| "application event loop is unavailable".to_string())
+                        .and_then(|_| {
+                            preflight_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .map_err(|_| "backend create preflight timed out".to_string())?
+                                .map_err(|error| error.message)
+                        });
+                    let result = preflight.and_then(|()| {
+                        match command.as_ref() {
+                            Some(command) => crate::terminal::pty::Pane::spawn_command(
+                                pane_id,
+                                80,
+                                24,
+                                resolved_cwd.clone(),
+                                app_tx,
+                                command,
+                                &[],
+                                history_budget,
+                                appearance,
+                            ),
+                            None => crate::terminal::pty::Pane::spawn(
+                                pane_id,
+                                80,
+                                24,
+                                resolved_cwd.clone(),
+                                app_tx,
+                                None,
+                                &shell,
+                                history_budget,
+                                appearance,
+                            ),
+                        }
+                        .map_err(|_| "PTY or root process failed to start".to_string())
+                    });
                     (resolved_cwd, branch, worktree, result)
                 }
                 Err(error) => (cwd, None, None, Err(error)),
@@ -799,6 +877,20 @@ impl App {
         let fail = |error: BackendError| {
             let _ = reply.send(error.envelope(&request_id));
         };
+        // A deletion may begin between preflight and spawn. A successfully
+        // spawned but discarded pane must never claim it was not started.
+        if let Err(error) = self.backend_create_preflight(&cwd, &commit.placement) {
+            fail(BackendError::mutation(
+                error.code,
+                error.message,
+                if result.is_ok() {
+                    DispatchEvidence::Started
+                } else {
+                    DispatchEvidence::NotStarted
+                },
+            ));
+            return;
+        }
         let pane = match result {
             Ok(pane) => pane,
             Err(_) => {
@@ -883,6 +975,14 @@ impl App {
                     ));
                     return;
                 };
+                if self.workspace_delete_pending(workspace_index) {
+                    fail(BackendError::mutation(
+                        "create_failed",
+                        "worktree deletion is still pending",
+                        DispatchEvidence::Started,
+                    ));
+                    return;
+                }
                 let layout = &mut self.workspaces[workspace_index].tabs[tab_index].layout;
                 let previous_focus = layout.focus;
                 layout.focus = target;
@@ -1503,7 +1603,7 @@ fn required_display_string<'a>(
     Ok(value)
 }
 
-fn bounded_text(text: &str, max_bytes: usize) -> String {
+pub(super) fn bounded_text(text: &str, max_bytes: usize) -> String {
     let mut end = text.len().min(max_bytes);
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
