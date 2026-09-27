@@ -581,11 +581,12 @@ impl VtEngine for AlacrittyEngine {
             (0..cols.min(3)).any(|col| matches!(grid[Line(row as i32)][Column(col)].c, '❯' | '>'))
         };
         // Bound the search by the visible grid, not an arbitrary input height.
-        // The nearest upper rail keeps an old composer above the cursor out.
-        let Some(top) = (0..cursor).rev().find(|&row| row_is_rail(row)) else {
-            return false;
-        };
-        row_has_prompt(top + 1) && ((cursor + 1)..rows).any(row_is_rail)
+        // A typed divider is not an upper rail: the rail must be immediately
+        // followed by Claude's prompt marker. Continue past divider text.
+        (0..cursor)
+            .rev()
+            .any(|top| row_has_prompt(top + 1) && row_is_rail(top))
+            && ((cursor + 1)..rows).any(row_is_rail)
     }
 
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
@@ -2699,6 +2700,19 @@ mod tests {
 
         e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[7;1HTrust this folder?\x1b[7;2H").as_bytes());
         assert!(!e.claude_composer_ready(), "old transcript is not input");
+    }
+
+    #[test]
+    fn claude_composer_accepts_a_typed_divider_above_the_cursor() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ input\x1b[4;1H{rail}\x1b[5;3Hmore input\x1b[8;1H{rail}\x1b[5;13H").as_bytes());
+        assert!(e.claude_composer_ready());
+
+        // Divider text alone must not establish a composer.
+        e.advance(b"\x1b[2;1H  input\x1b[5;13H");
+        assert!(!e.claude_composer_ready());
     }
 
     #[test]
