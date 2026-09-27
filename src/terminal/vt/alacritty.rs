@@ -583,10 +583,29 @@ impl VtEngine for AlacrittyEngine {
         // Bound the search by the visible grid, not an arbitrary input height.
         // A typed divider is not an upper rail: the rail must be immediately
         // followed by Claude's prompt marker. Continue past divider text.
-        (0..cursor)
+        let Some(top) = (0..cursor)
             .rev()
-            .any(|top| row_has_prompt(top + 1) && row_is_rail(top))
-            && ((cursor + 1)..rows).any(row_is_rail)
+            .find(|&row| row_has_prompt(row + 1) && row_is_rail(row))
+        else {
+            return false;
+        };
+        if !((cursor + 1)..rows).any(row_is_rail) {
+            return false;
+        }
+
+        // A rail between the prompt and cursor closes that input unless text
+        // immediately below it shows a continued, typed input section.
+        ((top + 2)..=cursor).all(|row| {
+            !row_is_rail(row)
+                || (row > top + 2
+                    && row < cursor
+                    && (0..cols).any(|col| {
+                        !matches!(
+                            grid[Line((row + 1) as i32)][Column(col)].c,
+                            '─' | ' ' | '\0'
+                        )
+                    }))
+        })
     }
 
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
@@ -2712,6 +2731,23 @@ mod tests {
 
         // Divider text alone must not establish a composer.
         e.advance(b"\x1b[2;1H  input\x1b[5;13H");
+        assert!(!e.claude_composer_ready());
+    }
+
+    #[test]
+    fn claude_composer_rejects_disconnected_rails() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+
+        // The old composer has already ended above the cursor. A separate
+        // rail farther down must not complete it into a live input region.
+        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ old input\x1b[4;1H{rail}\x1b[6;1Hunrelated text\x1b[8;1H{rail}\x1b[6;15H").as_bytes());
+        assert!(!e.claude_composer_ready());
+
+        // A rail directly after the old prompt is its lower edge, even when
+        // unrelated content begins on the next row.
+        e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old input\x1b[3;1H{rail}\x1b[4;1Hunrelated text\x1b[8;1H{rail}\x1b[4;15H").as_bytes());
         assert!(!e.claude_composer_ready());
     }
 

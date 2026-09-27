@@ -17265,7 +17265,7 @@ fi
         {
             let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
             engine.advance(
-                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[18;1H{rail}\x1b[36;1H{rail}\x1b[24;3H")
+                format!("\x1b[2J\x1b[H\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[18;1H{rail}\x1b[19;3Hcontinued input\x1b[36;1H{rail}\x1b[24;3H")
                     .as_bytes(),
             );
         }
