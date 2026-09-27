@@ -4281,6 +4281,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Filtering owns its own file index, so it can return matches before the
+    /// lazy root listing arrives. The loading affordance must not hide those
+    /// results or their hit rectangles.
+    #[test]
+    fn files_filter_remains_visible_while_the_root_listing_loads() {
+        let _env = crate::persist::test_env("files-filter-during-root-loading");
+        let root =
+            std::env::temp_dir().join(format!("luvus-filter-root-loading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let match_path = root.join("match.rs");
+        std::fs::write(&match_path, b"// match").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[app.active_ws].cwd = root.clone();
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.ensure_file_tree();
+        assert!(!app.file_tree.root_loaded());
+
+        app.files_focused = true;
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_file_tree_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        let filter = app.file_tree.filter.as_ref().unwrap();
+        assert!(app.handle_event(AppEvent::FileFilterResults {
+            instance: filter.instance,
+            generation: filter.generation,
+            rows: vec![crate::files::VisibleRow {
+                path: match_path,
+                name: "match.rs".into(),
+                depth: 0,
+                is_dir: false,
+                expanded: false,
+                loading: false,
+            }],
+            partial: false,
+        }));
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("f: m"), "the active query remains visible");
+        assert!(text.contains("match.rs"), "the indexed match is rendered");
+        assert_eq!(
+            app.file_tree_rects.len(),
+            1,
+            "the indexed match remains clickable"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// FILES can reach a folder through a symlink spelling while the open
     /// workspace stores the resolved cwd. Lexical `same_path` would miss it.
     #[cfg(unix)]
