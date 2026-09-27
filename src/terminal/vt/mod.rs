@@ -305,6 +305,19 @@ pub struct RetainedRowLayout {
     has_text: bool,
 }
 
+/// Terminal-only evidence for Claude's live composer.
+///
+/// A full-width divider typed inside a multiline prompt has the same terminal
+/// geometry as a stale compact composer. Keep that case explicit so callers
+/// can require a trusted Claude lifecycle signal instead of guessing from
+/// visible text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeComposerEvidence {
+    Absent,
+    Ready,
+    Ambiguous,
+}
+
 impl RetainedRowLayout {
     pub(crate) fn new(whitespace: Vec<bool>, has_text: bool) -> Self {
         Self {
@@ -359,6 +372,9 @@ pub trait VtEngine: Send {
     /// Detect Codex's live composer around the cursor. Returns `None` for
     /// scrollback, unrelated terminal content, or an incomplete layout.
     fn codex_composer_region(&self) -> Option<CodexComposerRegion>;
+
+    /// Inspect Claude's live input bounded by composer rails, not a menu choice.
+    fn claude_composer_evidence(&self) -> ClaudeComposerEvidence;
 
     /// Visit every visible cell as `(row, col, symbol, style)`. `symbol` is the
     /// cell's full grapheme cluster (base char + any combining/VS16/ZWJ chars),

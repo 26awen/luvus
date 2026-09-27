@@ -1160,15 +1160,12 @@ pub fn classify(
         None => (fallback, "no_positive_state_evidence", None, None, false),
     };
 
+    // A missing blocked rule is not positive evidence of an input box. Only
+    // agent-specific live composer probes can promote Unknown to Ready.
     let prompt_evidence = if prompt_blocked {
         PromptEvidence::Blocked
-    } else if agent.eq_ignore_ascii_case("codex") {
-        // Text alone cannot distinguish Codex's live composer from a prompt
-        // marker retained in the transcript. The app combines this raw state
-        // evidence with the VT engine's bounded composer geometry.
-        PromptEvidence::Unknown
     } else {
-        PromptEvidence::Ready
+        PromptEvidence::Unknown
     };
     Detection {
         state,
@@ -1181,11 +1178,29 @@ pub fn classify(
     }
 }
 
-/// Codex can be identified from its process/title before its startup chooser or
-/// composer exists. Server-owned launches keep prompt admission closed until
-/// the screen proves which surface won that race.
+/// Codex and Claude can be identified before their startup chooser or composer
+/// exists. Keep prompt admission closed until the live screen proves readiness.
 pub(crate) fn prompt_requires_positive_evidence(agent: &str) -> bool {
-    agent.eq_ignore_ascii_case("codex")
+    agent.eq_ignore_ascii_case("codex") || agent.eq_ignore_ascii_case("claude")
+}
+
+/// Probe composer geometry only for agents requiring positive evidence.
+pub(crate) fn live_composer_ready(
+    agent: &str,
+    engine: &dyn VtEngine,
+    claude_semantic_ready: bool,
+) -> Option<bool> {
+    if agent.eq_ignore_ascii_case("codex") {
+        Some(engine.codex_composer_region().is_some())
+    } else if agent.eq_ignore_ascii_case("claude") {
+        Some(match engine.claude_composer_evidence() {
+            crate::terminal::vt::ClaudeComposerEvidence::Absent => false,
+            crate::terminal::vt::ClaudeComposerEvidence::Ready => true,
+            crate::terminal::vt::ClaudeComposerEvidence::Ambiguous => claude_semantic_ready,
+        })
+    } else {
+        None
+    }
 }
 
 /// Re-evaluate raw prompt readiness from the current bounded screen. This
@@ -1207,10 +1222,8 @@ pub(crate) fn prompt_evidence(
         .is_some_and(|rule| rule.state == State::Blocked);
     if blocked {
         PromptEvidence::Blocked
-    } else if agent.eq_ignore_ascii_case("codex") {
-        PromptEvidence::Unknown
     } else {
-        PromptEvidence::Ready
+        PromptEvidence::Unknown
     }
 }
 
@@ -2582,6 +2595,28 @@ Would you like to proceed?
         assert_eq!(detection.prompt_evidence, PromptEvidence::Unknown);
         assert_eq!(
             prompt_evidence(Some("Codex"), bottom, "codex", &manifests),
+            PromptEvidence::Unknown
+        );
+    }
+
+    #[test]
+    fn claude_theme_picker_is_unknown_without_a_live_composer() {
+        let manifests = Manifests::builtin();
+        let bottom = "Let's get started.\nChoose the text style that looks best with your terminal\n❯ 2. Dark mode";
+        let detection = classify(
+            Some("Claude Code"),
+            bottom,
+            false,
+            false,
+            "claude",
+            "claude",
+            &["/usr/local/bin/claude".to_string()],
+            &manifests,
+        );
+        assert!(prompt_requires_positive_evidence("claude"));
+        assert_eq!(detection.prompt_evidence, PromptEvidence::Unknown);
+        assert_eq!(
+            prompt_evidence(Some("Claude Code"), bottom, "claude", &manifests),
             PromptEvidence::Unknown
         );
     }

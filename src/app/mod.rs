@@ -1911,6 +1911,9 @@ pub struct PaneStatus {
     /// Raw, non-debounced prompt-surface evidence. Prompt APIs consult this
     /// separately from the presentation state's quiet-dwell hysteresis.
     prompt_evidence: detect::PromptEvidence,
+    /// Claude's Stop hook confirms that an otherwise ambiguous rail layout is
+    /// the current input composer. Prompt submission and notifications clear it.
+    claude_prompt_semantic_ready: bool,
     /// A server-owned launch whose CLI needs a proven composer before prompt
     /// input. Existing panes retain the legacy permissive fallback when the
     /// detector has neither ready nor blocked evidence.
@@ -1950,6 +1953,7 @@ impl PaneStatus {
             force_detect: true,
             blocked_hint: None,
             prompt_evidence: detect::PromptEvidence::Unknown,
+            claude_prompt_semantic_ready: false,
             prompt_evidence_required: false,
             identity_source: "command_fallback",
             state_source: "no_positive_state_evidence",
@@ -18722,6 +18726,168 @@ fi
             app.pending_sound.is_none(),
             "an ignored prompt doesn't ring twice"
         );
+    }
+
+    #[test]
+    fn claude_prompt_methods_reject_theme_picker_but_accept_live_composer() {
+        let _env = crate::persist::test_env("claude-prompt-readiness");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(40, 40, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "claude".into();
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(b"\x1b[2J\x1b[HChoose the text style that looks best\x1b[7;1H\xe2\x9d\xaf 2. Dark mode\x1b[7;4H");
+        }
+        {
+            let status = app.status.get_mut(&id).unwrap();
+            status.prompt_evidence = crate::detect::PromptEvidence::Ready;
+            status.last_resize = Some(Instant::now());
+            status.force_detect = true;
+        }
+        app.detection_dirty.insert(id);
+        app.detect_tick(Instant::now());
+        assert_eq!(
+            app.status.get(&id).unwrap().prompt_evidence,
+            crate::detect::PromptEvidence::Unknown,
+        );
+        assert!(!app.agent_prompt_is_ready(id, false));
+
+        let target = id.0.to_string();
+        let sent = api_call(
+            &mut app,
+            "agent.send",
+            json!({"target":target,"text":"hello"}),
+        );
+        assert_eq!(sent["error"]["code"], "agent_not_ready");
+
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "test".into(),
+            json!({"target":target,"text":"hello"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["error"]["code"], "agent_not_ready");
+
+        let rail = "─".repeat(40);
+        // A completed old composer followed by an unrelated interaction has
+        // the same rail geometry as divider text inside a live prompt. Without
+        // lifecycle evidence, that ambiguous screen must remain closed.
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(
+                format!("\x1b[2J\x1b[1;1H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[32;1HUnrelated interaction\x1b[34;1H{rail}\x1b[32;8H")
+                    .as_bytes(),
+            );
+        }
+        assert!(!app.agent_prompt_is_ready(id, false));
+
+        // A real multiline composer may contain a full-width divider directly
+        // after the prompt. The Stop hook identifies it as the current input
+        // region without relying on visible-text heuristics.
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(
+                format!("\x1b[2J\x1b[1;1H{rail}\x1b[2;1H❯\u{a0} input\x1b[3;1H{rail}\x1b[5;1Hmore input\x1b[36;1H{rail}\x1b[24;3H")
+                    .as_bytes(),
+            );
+        }
+        assert!(!app.agent_prompt_is_ready(id, false));
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":"idle_prompt"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
+        assert!(
+            !app.agent_prompt_is_ready(id, false),
+            "idle notification alone does not establish composer readiness"
+        );
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"Stop"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
+        assert!(app.agent_prompt_is_ready(id, false));
+        assert!(app.agent_prompt_is_ready(id, true));
+        for notification_type in ["idle_prompt", "auth_success", "", "future_notification"] {
+            let sequence = crate::ipc::api::current_sequence(&app.events);
+            let reported = api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":notification_type}),
+            );
+            assert_eq!(reported["result"]["type"], "ok");
+            let events = crate::ipc::api::replayed_events_after(&app.events, sequence);
+            let hook = events
+                .iter()
+                .find(|event| event["event"] == "agent.hook")
+                .unwrap();
+            assert_eq!(hook["data"]["notification_type"], notification_type);
+            assert!(app.agent_prompt_is_ready(id, false), "{notification_type}");
+            assert!(app.agent_prompt_is_ready(id, true), "{notification_type}");
+        }
+        let (input_tx, input_rx) = mpsc::channel();
+        app.panes
+            .get_mut(&id)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+        let sent = api_call(
+            &mut app,
+            "agent.send",
+            json!({"target":target,"text":"hello","strict":true}),
+        );
+        assert_eq!(sent["result"]["pane"], id.0.to_string());
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            crate::terminal::pty::InputAction::Submit { .. }
+        ));
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "strict-ready".into(),
+            json!({"target":target,"text":"hello again","strict":true}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["result"]["submitted"], true);
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            crate::terminal::pty::InputAction::Submit { .. }
+        ));
+
+        let reported = api_call(
+            &mut app,
+            "pane.report_event",
+            json!({"pane":target,"agent":"claude","kind":"UserPromptSubmit"}),
+        );
+        assert_eq!(reported["result"]["type"], "ok");
+        assert!(
+            !app.agent_prompt_is_ready(id, false),
+            "prompt submission clears ambiguous composer readiness"
+        );
+        for notification_type in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+        ] {
+            api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Stop"}),
+            );
+            assert!(app.agent_prompt_is_ready(id, true));
+            api_call(
+                &mut app,
+                "pane.report_event",
+                json!({"pane":target,"agent":"claude","kind":"Notification","notification_type":notification_type}),
+            );
+            assert!(!app.agent_prompt_is_ready(id, false), "{notification_type}");
+            assert!(!app.agent_prompt_is_ready(id, true), "{notification_type}");
+        }
     }
 
     // A bursty/streaming agent has long pauses *within* one turn. The debounce

@@ -13,9 +13,9 @@ use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor, Processor, Rgb
 use ratatui::style::{Color, Modifier};
 
 use super::{
-    AlignedRows, CodexComposerRegion, Cursor, DamageCell, DamageHyperlink, DamageKind, DamageRow,
-    DamageSnapshot, HistoryMetrics, LinkedCellVisitor, RenderCell, RetainedRowLayout, VtEngine,
-    ALIGNED_WIDE_CELL,
+    AlignedRows, ClaudeComposerEvidence, CodexComposerRegion, Cursor, DamageCell, DamageHyperlink,
+    DamageKind, DamageRow, DamageSnapshot, HistoryMetrics, LinkedCellVisitor, RenderCell,
+    RetainedRowLayout, VtEngine, ALIGNED_WIDE_CELL,
 };
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
@@ -547,6 +547,63 @@ impl VtEngine for AlacrittyEngine {
             top: top as u16,
             bottom: bottom as u16,
         })
+    }
+
+    fn claude_composer_evidence(&self) -> ClaudeComposerEvidence {
+        let grid = self.term.grid();
+        if grid.display_offset() != 0 {
+            return ClaudeComposerEvidence::Absent;
+        }
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        if rows < 3 || cols < 8 {
+            return ClaudeComposerEvidence::Absent;
+        }
+        let cursor = grid.cursor.point.line.0.max(0) as usize;
+        if cursor >= rows {
+            return ClaudeComposerEvidence::Absent;
+        }
+
+        // Claude's input is between two solid full-width rails. Its theme
+        // picker also has a selected `❯` item, but not this live geometry.
+        let row_is_rail = |row: usize| {
+            let mut rails = 0;
+            for col in 0..cols {
+                match grid[Line(row as i32)][Column(col)].c {
+                    '─' => rails += 1,
+                    ' ' | '\0' => {}
+                    _ => return false,
+                }
+            }
+            rails >= cols - 2
+        };
+        let row_has_prompt = |row: usize| {
+            (0..cols.min(3)).any(|col| matches!(grid[Line(row as i32)][Column(col)].c, '❯' | '>'))
+        };
+        // Bound the search by the visible grid, not an arbitrary input height.
+        // A typed divider is not an upper rail: the rail must be immediately
+        // followed by Claude's prompt marker. Continue past divider text.
+        let Some(top) = (0..cursor)
+            .rev()
+            .find(|&top| row_has_prompt(top + 1) && row_is_rail(top))
+        else {
+            return ClaudeComposerEvidence::Absent;
+        };
+        let prompt = top + 1;
+
+        if !((cursor + 1)..rows).any(row_is_rail) {
+            return ClaudeComposerEvidence::Absent;
+        }
+
+        // A rail between the prompt and cursor can be either the closing rail
+        // of a stale compact composer or literal divider text inside a current
+        // multiline input. Their VT cells are identical, so preserve the
+        // ambiguity for a trusted Claude lifecycle event to resolve.
+        if ((prompt + 1)..=cursor).any(row_is_rail) {
+            ClaudeComposerEvidence::Ambiguous
+        } else {
+            ClaudeComposerEvidence::Ready
+        }
     }
 
     fn for_each_cell(&self, f: &mut dyn FnMut(u16, u16, &str, RenderCell)) {
@@ -2716,6 +2773,104 @@ mod tests {
         // not be restyled as the active composer.
         e.advance(b"\x1b[1;1Htranscript\x1b[2;1H");
         assert_eq!(e.codex_composer_region(), None);
+    }
+
+    #[test]
+    fn claude_composer_requires_live_input_between_solid_rails() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+
+        // Claude Code 2.1.283 hides the terminal cursor while drawing its own.
+        e.advance(
+            format!("\x1b[?25l\x1b[6;1H{rail}\x1b[7;1H❯\u{a0} \x1b[8;1H{rail}\x1b[7;3H").as_bytes(),
+        );
+        assert_eq!(e.claude_composer_evidence(), ClaudeComposerEvidence::Ready);
+
+        e.advance("\x1b[2J\x1b[HChoose the text style that looks best\x1b[7;1H❯ 2. Dark mode\x1b[8;1H╌╌╌╌╌╌╌╌╌╌\x1b[7;4H".as_bytes());
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Absent,
+            "theme selection is not input"
+        );
+
+        e.advance(format!("\x1b[2J\x1b[H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[7;1HTrust this folder?\x1b[7;2H").as_bytes());
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Absent,
+            "old transcript is not input"
+        );
+    }
+
+    #[test]
+    fn claude_composer_marks_a_typed_divider_as_ambiguous() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 10, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ input\x1b[4;1H{rail}\x1b[5;3Hmore input\x1b[8;1H{rail}\x1b[5;13H").as_bytes());
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Ambiguous
+        );
+
+        // The divider may begin immediately after the prompt and still belong
+        // to a valid multiline input. VT geometry cannot distinguish it from
+        // the stale compact-composer case below.
+        e.advance(
+            format!("\x1b[2J\x1b[1;1H{rail}\x1b[2;1H❯ input\x1b[3;1H{rail}\x1b[5;3Hmore input\x1b[8;1H{rail}\x1b[5;13H")
+                .as_bytes(),
+        );
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Ambiguous
+        );
+
+        // Divider text alone must not establish a composer.
+        e.advance(b"\x1b[2;1H  input\x1b[5;13H");
+        assert_eq!(e.claude_composer_evidence(), ClaudeComposerEvidence::Absent);
+    }
+
+    #[test]
+    fn claude_composer_accepts_tall_multiline_input() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 40, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+        e.advance(format!("\x1b[1;1H{rail}\x1b[2;1H❯ input\x1b[38;1H{rail}").as_bytes());
+        for cursor_row in [2, 18, 19, 35] {
+            e.advance(format!("\x1b[{cursor_row};3H").as_bytes());
+            assert_eq!(
+                e.claude_composer_evidence(),
+                ClaudeComposerEvidence::Ready,
+                "cursor row {cursor_row}"
+            );
+        }
+        e.advance(b"\x1b[39;1Hother screen");
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Absent,
+            "cursor below composer"
+        );
+    }
+
+    #[test]
+    fn claude_composer_rejects_disconnected_stale_prompt_and_rail() {
+        let (tx, _rx) = channel();
+        let mut e = AlacrittyEngine::new(40, 40, tx, budget_for_rows(40, 2_000));
+        let rail = "─".repeat(40);
+
+        // Rows 1-3 are a completed old composer. The cursor and later rail
+        // belong to another interaction and must not revive that stale prompt.
+        e.advance(
+            format!(
+                "\x1b[1;1H{rail}\x1b[2;1H❯ old prompt\x1b[3;1H{rail}\x1b[32;1HUnrelated interaction\x1b[34;1H{rail}\x1b[32;8H"
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            e.claude_composer_evidence(),
+            ClaudeComposerEvidence::Ambiguous
+        );
     }
 
     #[test]
