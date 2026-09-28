@@ -25,6 +25,13 @@ pub const OUTPUT_CAP: usize = 64 * 1024;
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MODULE_TOKEN_ENV: &str = "LUVUS_MODULE_TOKEN";
 
+/// Commander always sends its versioned document, even when the action
+/// declares no text input. Such an action may intentionally close stdin.
+pub struct StdinRequest {
+    pub bytes: Vec<u8>,
+    pub allow_closed_on_success: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModuleStatus {
@@ -138,12 +145,23 @@ pub fn spawn_with_input(
     root: PathBuf,
     argv: Vec<String>,
     env: Vec<(String, String)>,
-    input: Option<Vec<u8>>,
+    input: Option<StdinRequest>,
     app_tx: Sender<AppEvent>,
 ) {
     thread::spawn(move || {
-        let timeout = input.as_ref().map(|_| SYNC_TIMEOUT);
-        let (code, out, err) = run_with_input(&root, &argv, &env, input, timeout, None);
+        let allow_closed_on_success = input
+            .as_ref()
+            .is_some_and(|request| request.allow_closed_on_success);
+        let input = input.map(|request| request.bytes);
+        let (code, out, err) = run_with_input(
+            &root,
+            &argv,
+            &env,
+            input,
+            None,
+            None,
+            allow_closed_on_success,
+        );
         let _ = app_tx.send(AppEvent::ModuleCommandFinished {
             log_id,
             code,
@@ -173,6 +191,7 @@ pub fn run_sync(
         Some(request.to_string().into_bytes()),
         Some(SYNC_TIMEOUT),
         Some(cancelled),
+        false,
     );
     if code == Some(0) {
         Ok(out)
@@ -218,7 +237,7 @@ fn run(
     timeout: Option<Duration>,
     cancelled: Option<&AtomicBool>,
 ) -> (Option<i32>, String, String) {
-    run_with_input(root, argv, env, None, timeout, cancelled)
+    run_with_input(root, argv, env, None, timeout, cancelled, false)
 }
 
 fn run_with_input(
@@ -228,6 +247,7 @@ fn run_with_input(
     input: Option<Vec<u8>>,
     timeout: Option<Duration>,
     cancelled: Option<&AtomicBool>,
+    allow_closed_on_success: bool,
 ) -> (Option<i32>, String, String) {
     let Some((program, args)) = argv.split_first() else {
         return (None, String::new(), "empty command".to_string());
@@ -333,12 +353,19 @@ fn run_with_input(
         .unwrap_or_else(|_| Err(std::io::Error::other("module stdin writer panicked")));
     let out = t_out.join().unwrap_or_default();
     let mut err = t_err.join().unwrap_or_default();
-    let input_failed = input_result.is_err();
+    let closed_stdin_is_ok = allow_closed_on_success
+        && input_result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+        && status.as_ref().is_ok_and(|status| status.success());
+    let input_failed = input_result.is_err() && !closed_stdin_is_ok;
     if let Err(error) = input_result {
-        if !err.is_empty() && !err.ends_with('\n') {
-            err.push('\n');
+        if !closed_stdin_is_ok {
+            if !err.is_empty() && !err.ends_with('\n') {
+                err.push('\n');
+            }
+            err.push_str(&format!("write stdin failed: {error}"));
         }
-        err.push_str(&format!("write stdin failed: {error}"));
     }
     drop(tree_guard);
     if timed_out || was_cancelled {
@@ -463,6 +490,7 @@ mod tests {
             Some(br#"{"version":1,"operation":"create"}"#.to_vec()),
             Some(Duration::from_secs(2)),
             None,
+            false,
         );
         assert_eq!(code, Some(0), "{err}");
         assert_eq!(out, r#"{"version":1,"operation":"create"}"#);
@@ -483,9 +511,31 @@ mod tests {
             Some(vec![b'x'; 1024 * 1024]),
             Some(Duration::from_secs(2)),
             None,
+            false,
         );
         assert_eq!(code, None);
         assert!(err.contains("write stdin failed"), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commander_no_text_action_can_close_stdin_and_exit_successfully() {
+        let root = std::env::temp_dir();
+        let (code, _out, err) = run_with_input(
+            &root,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec 0>&-; sleep 0.05; exit 0".into(),
+            ],
+            &[],
+            Some(vec![b'x'; 1024 * 1024]),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(code, Some(0), "{err}");
+        assert!(err.is_empty(), "{err}");
     }
 
     #[cfg(unix)]

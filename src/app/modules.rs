@@ -642,9 +642,9 @@ impl App {
         label: String,
         extra_env: Vec<(String, String)>,
         source_target: (&str, Target),
-        input: Vec<u8>,
+        input: runtime::StdinRequest,
     ) -> Result<u64, String> {
-        if input.len() > crate::commander::MAX_INVOCATION_BYTES {
+        if input.bytes.len() > crate::commander::MAX_INVOCATION_BYTES {
             return Err("Module command input exceeds 64 KiB".into());
         }
         self.run_module_command_for_with_input(
@@ -664,7 +664,7 @@ impl App {
         label: String,
         extra_env: Vec<(String, String)>,
         source_target: (&str, Target),
-        input: Option<Vec<u8>>,
+        input: Option<runtime::StdinRequest>,
     ) -> Result<u64, String> {
         let (source, target) = source_target;
         let module_id = self.module_id_for(module_id)?;
@@ -762,17 +762,15 @@ impl App {
         if let Some(commander) = self.commander.as_mut() {
             if let Some((running, label)) = commander.running_module.as_ref() {
                 if *running == log_id {
-                    if commander.draft.is_empty() {
-                        let outcome = if succeeded { "succeeded" } else { "failed" };
-                        commander.receipt = Some(format!(
-                            "{label} {outcome} · log {log_id}{}",
-                            if detail.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {detail}")
-                            }
-                        ));
-                    }
+                    let outcome = if succeeded { "succeeded" } else { "failed" };
+                    commander.receipt = Some(format!(
+                        "{label} {outcome} · log {log_id}{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {detail}")
+                        }
+                    ));
                     commander.running_module = None;
                 }
             }

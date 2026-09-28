@@ -256,7 +256,9 @@ impl App {
             .ok_or_else(|| format!("Module {} is unavailable", spec.module_id))?;
         let action = module
             .manifest
-            .action(&spec.action_id)
+            .actions
+            .iter()
+            .find(|action| action.id == spec.action_id)
             .ok_or_else(|| format!("Action {} is unavailable", spec.action_id))?;
         if !allowed_on(action.platforms.as_ref()) {
             return Err("Module action is unavailable on this platform".into());
@@ -448,7 +450,10 @@ impl App {
                         invocation.spec.action_id.clone(),
                     )],
                     ("commander", target),
-                    document,
+                    crate::module::runtime::StdinRequest {
+                        bytes: document,
+                        allow_closed_on_success: invocation.spec.input == CommanderInput::None,
+                    },
                 )?;
                 Ok(Some((log_id, invocation)))
             });

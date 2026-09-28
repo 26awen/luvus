@@ -395,6 +395,30 @@ fn linked_module_catalog_refreshes_on_enable_and_unlink() {
 }
 
 #[cfg(unix)]
+fn recv_module_completion(
+    rx: &std::sync::mpsc::Receiver<crate::event::AppEvent>,
+    expected: u64,
+) -> (Option<i32>, String, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let event = rx
+            .recv_timeout(remaining)
+            .expect("module command did not report completion");
+        if let crate::event::AppEvent::ModuleCommandFinished {
+            log_id,
+            code,
+            out,
+            err,
+        } = event
+        {
+            assert_eq!(log_id, expected);
+            return (code, out, err);
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn commander_module_action_writes_versioned_json_once_and_receives_completion() {
     let _env = crate::persist::test_env("commander-module-run");
@@ -423,23 +447,13 @@ fn commander_module_action_writes_versioned_json_once_and_receives_completion() 
     let log = &app.module_logs[0];
     assert_eq!(log.argv, vec!["sh", "-c", "cat"]);
     let log_id = log.id;
-    let event = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    let crate::event::AppEvent::ModuleCommandFinished {
-        log_id: completed,
-        code,
-        out,
-        err,
-    } = event
-    else {
-        panic!("module command did not report completion");
-    };
-    assert_eq!(completed, log_id);
+    let (code, out, err) = recv_module_completion(&rx, log_id);
     let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(payload["version"], 1);
     assert_eq!(payload["command"], "review");
     assert_eq!(payload["target"]["pane_id"], pane.0.to_string());
     assert_eq!(payload["text"], "Check\n@p999 is text");
-    app.module_command_finished(completed, code, out, err);
+    app.module_command_finished(log_id, code, out, err);
     assert_eq!(
         app.module_logs[0].status,
         crate::module::runtime::ModuleStatus::Succeeded
@@ -495,16 +509,8 @@ fn commander_module_context_uses_the_target_workspace_not_active_workspace() {
     ));
     app.commander_prepare();
     assert_eq!(app.module_logs.len(), 1);
-    let event = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    let crate::event::AppEvent::ModuleCommandFinished {
-        log_id,
-        code,
-        out,
-        err,
-    } = event
-    else {
-        panic!("module command did not report completion");
-    };
+    let log_id = app.module_logs[0].id;
+    let (code, out, err) = recv_module_completion(&rx, log_id);
     assert_eq!(code, Some(0), "{err}");
     let (context, input) = out.split_once('\n').unwrap();
     let context: serde_json::Value = serde_json::from_str(context).unwrap();
@@ -537,17 +543,10 @@ fn commander_module_failure_receipt_uses_the_matching_log() {
     app.commander.as_mut().unwrap().insert("$fail");
     app.commander_prepare();
     assert_eq!(app.module_logs.len(), 1);
-    let event = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    let crate::event::AppEvent::ModuleCommandFinished {
-        log_id,
-        code,
-        out,
-        err,
-    } = event
-    else {
-        panic!("module command did not report completion");
-    };
+    let log_id = app.module_logs[0].id;
+    let (code, out, err) = recv_module_completion(&rx, log_id);
     assert_ne!(code, Some(0));
+    app.commander.as_mut().unwrap().insert("next draft");
     app.module_command_finished(log_id, code, out, err);
     assert_eq!(
         app.module_logs[0].status,
@@ -556,6 +555,7 @@ fn commander_module_failure_receipt_uses_the_matching_log() {
     let receipt = app.commander.as_ref().unwrap().receipt.as_deref().unwrap();
     assert!(receipt.contains("failed"), "{receipt}");
     assert!(receipt.contains("expected-failure"), "{receipt}");
+    assert_eq!(app.commander.as_ref().unwrap().draft, "next draft");
 }
 
 #[test]
