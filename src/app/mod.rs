@@ -2349,16 +2349,22 @@ pub(crate) struct WorktreeRemoveBlockers {
 struct WorktreeRemoveOwnership {
     path: PathBuf,
     aliases: std::collections::BTreeSet<PathBuf>,
+    outside: std::collections::BTreeSet<PathBuf>,
 }
 
 impl WorktreeRemoveOwnership {
     fn contains(&self, candidate: &Path) -> bool {
+        if let Ok(resolved) = std::fs::canonicalize(candidate) {
+            return crate::platform::is_subpath(&resolved, &self.path);
+        }
+        // The deleted checkout may have held a symlink to an outside directory.
+        // Preserve its pre-delete classification when that link no longer resolves.
+        if self.outside.contains(candidate) {
+            return false;
+        }
         self.aliases
             .iter()
             .any(|target| crate::platform::is_subpath(candidate, target))
-            || std::fs::canonicalize(candidate)
-                .map(|candidate| crate::platform::is_subpath(&candidate, &self.path))
-                .unwrap_or(false)
     }
 }
 
@@ -6036,10 +6042,9 @@ impl App {
                     .unwrap_or(false)
         };
         let inside_target = |candidate: &std::path::Path| {
-            crate::platform::is_subpath(candidate, path)
-                || std::fs::canonicalize(candidate)
-                    .map(|candidate| crate::platform::is_subpath(&candidate, path))
-                    .unwrap_or(false)
+            std::fs::canonicalize(candidate)
+                .map(|candidate| crate::platform::is_subpath(&candidate, path))
+                .unwrap_or_else(|_| crate::platform::is_subpath(candidate, path))
         };
         let mut target_panes = std::collections::BTreeSet::new();
         for workspace in &self.workspaces {
@@ -6064,18 +6069,26 @@ impl App {
     fn capture_worktree_remove_ownership(&self, path: &std::path::Path) -> WorktreeRemoveOwnership {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut aliases = std::collections::BTreeSet::from([path.to_path_buf(), canonical.clone()]);
-        for workspace in &self.workspaces {
-            if crate::platform::same_path(&workspace.cwd, &canonical)
-                || std::fs::canonicalize(&workspace.cwd)
-                    .map(|candidate| crate::platform::same_path(&candidate, &canonical))
-                    .unwrap_or(false)
-            {
-                aliases.insert(workspace.cwd.clone());
+        let mut outside = std::collections::BTreeSet::new();
+        for cwd in self
+            .workspaces
+            .iter()
+            .map(|workspace| &workspace.cwd)
+            .chain(self.panes.values().map(|pane| &pane.cwd))
+        {
+            if let Ok(resolved) = std::fs::canonicalize(cwd) {
+                if crate::platform::is_subpath(&resolved, &canonical) {
+                    // Nested symlink aliases stop resolving after deletion.
+                    aliases.insert(cwd.clone());
+                } else {
+                    outside.insert(cwd.clone());
+                }
             }
         }
         WorktreeRemoveOwnership {
             path: canonical,
             aliases,
+            outside,
         }
     }
 
@@ -11513,6 +11526,81 @@ mod tests {
             .any(|workspace| workspace.id == removed_workspace_id));
         assert_eq!(app.orch.task("t1").unwrap().assignee, None);
         assert!(app.orch.leases.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_preserves_pane_through_outbound_symlink() {
+        let _env = crate::persist::test_env("worktree-remove-outbound-symlink");
+        let (base, _repo, worktree) =
+            repo_with_sibling_worktree("worktree-remove-outbound-symlink");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = worktree.join("outside-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable = app.layout().focus;
+        let outside_pane = app.split_pane(stable, Axis::Col, true).unwrap();
+        app.panes.get_mut(&outside_pane).unwrap().cwd = link;
+        let status = app.status.get_mut(&outside_pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        assert!(app.worktree_remove_blockers(&worktree).is_empty());
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(outside.exists());
+        assert!(app.panes.contains_key(&outside_pane));
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_closes_nested_symlink_owners() {
+        let _env = crate::persist::test_env("worktree-remove-nested-symlink");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-nested-symlink");
+        let nested = worktree.join("nested");
+        std::fs::create_dir_all(nested.join("child")).unwrap();
+        let alias = base.join("nested-alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable = app.layout().focus;
+        let cross_workspace_pane = app.split_pane(stable, Axis::Col, true).unwrap();
+        app.panes.get_mut(&cross_workspace_pane).unwrap().cwd = alias.join("child");
+        assert!(app.create_workspace_at(worktree.clone()));
+        let removed_workspace = app.ws().id.clone();
+        let removed_pane = app.layout().focus;
+        app.workspaces[app.active_ws].cwd = alias.clone();
+        app.panes.get_mut(&removed_pane).unwrap().cwd = alias;
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(app.panes.contains_key(&stable));
+        assert!(!app.panes.contains_key(&cross_workspace_pane));
+        assert!(!app.panes.contains_key(&removed_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == removed_workspace));
 
         drop(app);
         std::fs::remove_dir_all(base).unwrap();
