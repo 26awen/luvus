@@ -87,6 +87,10 @@ impl App {
                     if !all_tabs && tab_index != workspace.active_tab {
                         continue;
                     }
+                    // Dashboard layouts contain placeholder IDs, not live panes.
+                    if tab.is_git() || tab.is_orch() || tab.is_mission() {
+                        continue;
+                    }
                     for id in tab.layout.leaves() {
                         let (agent, status) = self
                             .status

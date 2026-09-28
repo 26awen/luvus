@@ -350,6 +350,35 @@ fn pane_list_all_tabs_discovers_inactive_panes_without_changing_focus() {
 }
 
 #[test]
+fn pane_list_excludes_dashboard_placeholder_leaves() {
+    let (_env, mut app) = app("pane-list-dashboard-placeholders");
+    let pane = app.layout().focus;
+    let repo = std::path::PathBuf::from(std::env::var_os("LUVUS_HOME").unwrap()).join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-q"]);
+    app.workspaces[0].cwd = repo;
+
+    app.open_git_tab(0);
+    let git_placeholder = app.layout().focus;
+    app.open_orch_board();
+    let orch_placeholder = app.layout().focus;
+    app.open_mission_control(0);
+    let mission_placeholder = app.layout().focus;
+    for placeholder in [git_placeholder, orch_placeholder, mission_placeholder] {
+        assert!(!app.panes.contains_key(&placeholder));
+    }
+
+    let all = app.dispatch("pane.list", &json!({})).unwrap();
+    assert_eq!(all["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(all["panes"][0]["pane"], pane.0.to_string());
+    let current = app
+        .dispatch("pane.list", &json!({"all_tabs": false}))
+        .unwrap();
+    assert!(current["panes"].as_array().unwrap().is_empty());
+    assert_eq!(app.layout().focus, mission_placeholder);
+}
+
+#[test]
 fn pane_ids_are_checked_before_resolution_or_mutation() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new(80, 24, tx).unwrap();
