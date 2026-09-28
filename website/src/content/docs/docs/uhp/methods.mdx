@@ -556,9 +556,10 @@ the fence must verify this capability before calling it; do not treat a queued
 legacy response as proof that the fence was enforced.
 
 Before either prompt method queues input, Luvus rejects detected startup,
-sign-in, selection, and approval screens with `agent_not_ready`. Claude and
-Codex also require positive evidence of their live input composers, so an
-unrecognised screen cannot receive a prompt. Pass `strict:true` to either
+sign-in, selection, and approval screens with `agent_not_ready`. Claude,
+Codex, and OpenCode also require positive evidence of their live input
+composers, so an unrecognised screen cannot receive a prompt. Pass
+`strict:true` to either
 `agent.prompt` or `agent.send` to require positive composer evidence for any
 agent; an agent without a detector returns `agent_not_ready`. The default for
 other agents remains permissive on Unknown evidence. Rejection queues neither

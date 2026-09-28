@@ -376,6 +376,9 @@ pub trait VtEngine: Send {
     /// Inspect Claude's live input bounded by composer rails, not a menu choice.
     fn claude_composer_evidence(&self) -> ClaudeComposerEvidence;
 
+    /// Inspect OpenCode's live input box around the cursor.
+    fn opencode_composer_ready(&self) -> bool;
+
     /// Visit every visible cell as `(row, col, symbol, style)`. `symbol` is the
     /// cell's full grapheme cluster (base char + any combining/VS16/ZWJ chars),
     /// so emoji and accented text render whole. Wide-char spacer cells are

@@ -1178,10 +1178,12 @@ pub fn classify(
     }
 }
 
-/// Codex and Claude can be identified before their startup chooser or composer
+/// These agents can be identified before their startup chooser or composer
 /// exists. Keep prompt admission closed until the live screen proves readiness.
 pub(crate) fn prompt_requires_positive_evidence(agent: &str) -> bool {
-    agent.eq_ignore_ascii_case("codex") || agent.eq_ignore_ascii_case("claude")
+    agent.eq_ignore_ascii_case("codex")
+        || agent.eq_ignore_ascii_case("claude")
+        || agent.eq_ignore_ascii_case("opencode")
 }
 
 /// Probe composer geometry only for agents requiring positive evidence.
@@ -1198,6 +1200,8 @@ pub(crate) fn live_composer_ready(
             crate::terminal::vt::ClaudeComposerEvidence::Ready => true,
             crate::terminal::vt::ClaudeComposerEvidence::Ambiguous => claude_semantic_ready,
         })
+    } else if agent.eq_ignore_ascii_case("opencode") {
+        Some(engine.opencode_composer_ready())
     } else {
         None
     }
@@ -2619,6 +2623,24 @@ Would you like to proceed?
             prompt_evidence(Some("Claude Code"), bottom, "claude", &manifests),
             PromptEvidence::Unknown
         );
+    }
+
+    #[test]
+    fn opencode_requires_live_composer_evidence() {
+        let manifests = Manifests::builtin();
+        let detection = classify(
+            Some("OpenCode"),
+            "Starting OpenCode...",
+            false,
+            false,
+            "opencode",
+            "opencode",
+            &["/usr/local/bin/opencode --standalone".to_string()],
+            &manifests,
+        );
+        assert!(prompt_requires_positive_evidence("opencode"));
+        assert_eq!(detection.state, State::Idle);
+        assert_eq!(detection.prompt_evidence, PromptEvidence::Unknown);
     }
 
     #[test]
