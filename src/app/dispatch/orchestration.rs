@@ -3,6 +3,10 @@
 use super::*;
 use super::{params::*, projection::*};
 
+fn valid_worktree_remove_path(path: &str) -> bool {
+    !path.is_empty() && path.chars().count() <= 4096
+}
+
 impl App {
     // ── worktrees (docs/18 WT-3) ──
     pub(super) fn api_worktree_list(&mut self, method: &str, p: &Value) -> DispatchResult {
@@ -54,12 +58,12 @@ impl App {
             let path = p
                 .get("path")
                 .and_then(Value::as_str)
-                .filter(|path| !path.is_empty() && path.len() <= 4096)
+                .filter(|path| valid_worktree_remove_path(path))
                 .map(std::path::PathBuf::from)
                 .ok_or_else(|| {
                     (
                         "invalid_request".to_string(),
-                        "path must be a non-empty string of at most 4096 bytes".to_string(),
+                        "path must be a non-empty string of at most 4096 characters".to_string(),
                     )
                 })?;
             let force = match p.get("force") {
@@ -1249,5 +1253,17 @@ impl App {
                     "no pane id — run inside a luvus pane or pass a pane id".to_string(),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_worktree_remove_path;
+
+    #[test]
+    fn worktree_remove_path_limit_counts_unicode_characters() {
+        assert!(valid_worktree_remove_path("é"));
+        assert!(valid_worktree_remove_path(&"é".repeat(4096)));
+        assert!(!valid_worktree_remove_path(&"é".repeat(4097)));
     }
 }

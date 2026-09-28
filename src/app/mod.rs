@@ -5942,6 +5942,7 @@ impl App {
         Ok(())
     }
 
+    /// Collect the live ownership that makes normal removal unsafe.
     fn worktree_remove_blockers(&self, path: &std::path::Path) -> WorktreeRemoveBlockers {
         use std::collections::BTreeSet;
 
@@ -5951,28 +5952,7 @@ impl App {
                     .map(|candidate| crate::platform::same_path(&candidate, path))
                     .unwrap_or(false)
         };
-        let inside_target = |candidate: &std::path::Path| {
-            crate::platform::is_subpath(candidate, path)
-                || std::fs::canonicalize(candidate)
-                    .map(|candidate| crate::platform::is_subpath(&candidate, path))
-                    .unwrap_or(false)
-        };
-        let mut target_panes = BTreeSet::new();
-        for workspace in &self.workspaces {
-            if same_target(&workspace.cwd) {
-                for pane in workspace.tabs.iter().flat_map(|tab| tab.layout.leaves()) {
-                    if self.panes.contains_key(&pane) {
-                        target_panes.insert(pane.0);
-                    }
-                }
-            }
-        }
-        for (&pane, terminal) in &self.panes {
-            if inside_target(&terminal.cwd) {
-                target_panes.insert(pane.0);
-            }
-        }
-
+        let target_panes = self.worktree_target_panes(path);
         let panes = target_panes
             .iter()
             .filter_map(|pane| {
@@ -6031,13 +6011,55 @@ impl App {
         }
     }
 
+    /// Resolve every live pane whose filesystem context will disappear with a
+    /// worktree, including panes anchored in a different workspace.
+    fn worktree_target_panes(&self, path: &std::path::Path) -> std::collections::BTreeSet<u32> {
+        let same_target = |candidate: &std::path::Path| {
+            crate::platform::same_path(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::same_path(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let inside_target = |candidate: &std::path::Path| {
+            crate::platform::is_subpath(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::is_subpath(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let mut target_panes = std::collections::BTreeSet::new();
+        for workspace in &self.workspaces {
+            if same_target(&workspace.cwd) {
+                for pane in workspace.tabs.iter().flat_map(|tab| tab.layout.leaves()) {
+                    if self.panes.contains_key(&pane) {
+                        target_panes.insert(pane.0);
+                    }
+                }
+            }
+        }
+        for (&pane, terminal) in &self.panes {
+            if inside_target(&terminal.cwd) {
+                target_panes.insert(pane.0);
+            }
+        }
+        target_panes
+    }
+
+    /// Reconcile application ownership after Git or a provider has removed the
+    /// checkout. Panes may be anchored elsewhere while their cwd is inside it.
     fn finish_explicit_worktree_remove(&mut self, path: &std::path::Path) {
-        if let Some(index) = self
+        let target_panes = self.worktree_target_panes(path);
+        while let Some(index) = self
             .workspaces
             .iter()
             .position(|workspace| crate::platform::same_path(&workspace.cwd, path))
         {
             self.close_workspace(index);
+        }
+        for pane in target_panes {
+            let pane = PaneId(pane);
+            if self.panes.contains_key(&pane) {
+                self.close_pane(pane);
+            }
         }
     }
 
@@ -11384,6 +11406,73 @@ mod tests {
             .workspaces
             .iter()
             .any(|workspace| workspace.id == workspace_id));
+        assert!(app.orch.leases.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn forced_worktree_remove_closes_cross_workspace_pane_in_deleted_cwd() {
+        let _env = crate::persist::test_env("worktree-remove-cross-workspace");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-cross-workspace");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let workspace_id = app.ws().id.clone();
+        let stable_pane = app.layout().focus;
+        let cross_workspace_pane = app
+            .split_pane(stable_pane, Axis::Col, true)
+            .expect("split pane");
+        let nested_cwd = worktree.join("nested");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        app.panes.get_mut(&cross_workspace_pane).unwrap().cwd = nested_cwd;
+
+        assert!(app.create_workspace_at(worktree.clone()));
+        let removed_workspace_id = app.ws().id.clone();
+        let status = app.status.get_mut(&cross_workspace_pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        let added = api_call(
+            &mut app,
+            "task.add",
+            json!({"title":"cross workspace worker", "workspace_id":workspace_id}),
+        );
+        assert_eq!(added["result"]["task"]["id"], "t1", "{added}");
+        let claimed = api_call(
+            &mut app,
+            "task.claim",
+            json!({"id":"t1", "pane":cross_workspace_pane.0.to_string()}),
+        );
+        assert_eq!(claimed["result"]["task"]["status"], "claimed", "{claimed}");
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Running)
+            .unwrap();
+        let lease = api_call(
+            &mut app,
+            "lease.acquire",
+            json!({
+                "task":"t1",
+                "paths":["src/**"],
+                "pane":cross_workspace_pane.0.to_string()
+            }),
+        );
+        assert_eq!(lease["result"]["lease"]["id"], "l1", "{lease}");
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(app.panes.contains_key(&stable_pane));
+        assert!(!app.panes.contains_key(&cross_workspace_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == removed_workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, None);
         assert!(app.orch.leases.is_empty());
 
         drop(app);
