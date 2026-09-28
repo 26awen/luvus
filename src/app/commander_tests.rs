@@ -882,6 +882,38 @@ fn slash_after_target_stays_literal_and_reaches_the_pane() {
 }
 
 #[test]
+fn slash_after_target_reaches_a_ready_agent_pane() {
+    let _env = crate::persist::test_env("commander-agent-targeted-slash");
+    let (tx, _) = std::sync::mpsc::channel();
+    let mut app = App::new(80, 24, tx).unwrap();
+    let pane = app.layout().focus;
+    let generation = app.panes[&pane].engine.lock().unwrap().output_generation();
+    let status = app.status.get_mut(&pane).unwrap();
+    status.agent = "claude".into();
+    status.state = crate::ui::theme::State::Idle;
+    status.prompt_evidence = crate::detect::PromptEvidence::Ready;
+    status.last_detect_generation = Some(generation);
+    status.force_detect = false;
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    app.panes
+        .get_mut(&pane)
+        .unwrap()
+        .replace_input_sender_for_test(input_tx);
+
+    app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    app.commander_paste("status");
+    app.commander_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let crate::terminal::pty::InputAction::Submit { paste, .. } = input_rx.try_recv().unwrap()
+    else {
+        panic!("targeted slash command must reach the ready agent");
+    };
+    assert_eq!(paste, b"/status");
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
 fn slash_enter_accepts_a_suggestion_before_dispatching() {
     let _env = crate::persist::test_env("commander-slash-enter");
     let (tx, _) = std::sync::mpsc::channel();
