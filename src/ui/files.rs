@@ -88,7 +88,7 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
     // A folder never visited yet has no listing until the worker read lands.
     // Say so instead of leaving a blank dock that reads as an empty folder;
     // a revisited folder renders its cached listing immediately instead.
-    if !app.file_tree.root_loaded() {
+    if !app.file_tree.root_loaded() && app.file_tree.filter.is_none() {
         line_at(
             f,
             list_top,
