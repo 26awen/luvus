@@ -486,6 +486,8 @@ fn canonical_signal(signal: &str) -> String {
         ("SIGTSTP", libc::SIGTSTP),
         ("SIGTTIN", libc::SIGTTIN),
         ("SIGTTOU", libc::SIGTTOU),
+        ("SIGXCPU", libc::SIGXCPU),
+        ("SIGXFSZ", libc::SIGXFSZ),
     ] {
         // SAFETY: strsignal returns either a null pointer or a NUL-terminated
         // string for a valid platform signal constant. Read it immediately.
@@ -497,4 +499,24 @@ fn canonical_signal(signal: &str) -> String {
         }
     }
     signal.to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::PtyExitStatus;
+
+    #[test]
+    fn resource_limit_signals_use_stable_names() {
+        for (number, name) in [(libc::SIGXCPU, "SIGXCPU"), (libc::SIGXFSZ, "SIGXFSZ")] {
+            // SAFETY: these are valid signal constants and strsignal returns
+            // a NUL-terminated description, copied by with_signal below.
+            let description = unsafe { libc::strsignal(number) };
+            assert!(!description.is_null());
+            let raw = unsafe { std::ffi::CStr::from_ptr(description) }
+                .to_str()
+                .unwrap();
+            let status = portable_pty::ExitStatus::with_signal(raw);
+            assert_eq!(PtyExitStatus::from(status).signal.as_deref(), Some(name));
+        }
+    }
 }
