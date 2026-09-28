@@ -210,6 +210,14 @@ only in worktree mode, and `task.merge` returns
 `focus: false` to create and start the worker without changing the operator's
 current workspace, tab, pane focus, or zoom state.
 
+`worktree.remove` accepts an exact `path` and optional boolean `force`. Without
+force, Luvus returns `worktree_in_use` before deletion when the worktree owns a
+working or blocked agent pane, an unfinished bound task, or a related lease.
+The error names the blockers so callers can finish or release the work first.
+`force: true` explicitly bypasses that guard, stops panes in the removed
+workspace, and should be used only after the operator confirms the destructive
+cleanup.
+
 `task.retry` accepts `{"id":"t1"}` for terminal `done`, `failed`, `review`, or
 `blocked` work. Manual tasks return to `queued` with an incremented `attempt`
 and bounded `previous_attempts`. Automation-owned tasks return a new

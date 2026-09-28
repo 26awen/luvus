@@ -51,3 +51,4 @@
 {"id":"send-terminal-fence","method":"agent.send","params":{"target":"7","text":"review","terminal_id":"0123456789abcdef0123456789abcdef"}}
 {"id":"keys-content-fence","method":"agent.keys","params":{"target":"7","keys":["enter"],"if_content_revision":12,"terminal_id":"0123456789abcdef0123456789abcdef"}}
 {"id":"task-retry","method":"task.retry","params":{"id":"t4"}}
+{"id":"worktree-remove-force","method":"worktree.remove","params":{"path":"/workspace/topic","force":true}}

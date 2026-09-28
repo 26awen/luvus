@@ -58,7 +58,11 @@ deletes send:
 ```
 
 `force` is `true` for a confirmed sidebar deletion and `false` for the CLI/API
-command unless requested otherwise.
+command unless `--force` or `force: true` is explicitly requested. Normal
+CLI/API removal fails with `worktree_in_use` before deletion when the worktree
+has a working or blocked agent pane, an unfinished bound task, or a related
+lease. Finish or release the named work first. Forced removal bypasses that
+guard and stops panes in the removed workspace.
 Confirmed sidebar deletion also supplies `expected_identity` (`volume` and
 `file`). A removal provider must reject a target whose directory identity has
 changed and bind deletion to the checked directory, not just its path. Providers

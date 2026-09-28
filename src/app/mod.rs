@@ -2309,6 +2309,66 @@ impl MenuScroll {
 pub const WORKTREE_CREATE_PENDING: &str = "__worktree_create_pending__";
 pub const WORKTREE_REMOVE_PENDING: &str = "__worktree_remove_pending__";
 
+#[derive(Debug)]
+pub(crate) enum WorktreeRemoveError {
+    InUse(WorktreeRemoveBlockers),
+    Git(String),
+}
+
+impl WorktreeRemoveError {
+    pub(crate) fn into_dispatch(self) -> (String, String) {
+        match self {
+            Self::InUse(blockers) => ("worktree_in_use".into(), blockers.message()),
+            Self::Git(message) => ("git_error".into(), message),
+        }
+    }
+}
+
+impl std::fmt::Display for WorktreeRemoveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUse(blockers) => formatter.write_str(&blockers.message()),
+            Self::Git(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for WorktreeRemoveError {
+    fn from(message: String) -> Self {
+        Self::Git(message)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WorktreeRemoveBlockers {
+    panes: Vec<String>,
+    tasks: Vec<String>,
+    leases: Vec<String>,
+}
+
+impl WorktreeRemoveBlockers {
+    fn is_empty(&self) -> bool {
+        self.panes.is_empty() && self.tasks.is_empty() && self.leases.is_empty()
+    }
+
+    fn message(&self) -> String {
+        let mut details = Vec::new();
+        if !self.panes.is_empty() {
+            details.push(format!("panes [{}]", self.panes.join(", ")));
+        }
+        if !self.tasks.is_empty() {
+            details.push(format!("tasks [{}]", self.tasks.join(", ")));
+        }
+        if !self.leases.is_empty() {
+            details.push(format!("leases [{}]", self.leases.join(", ")));
+        }
+        format!(
+            "worktree is in use by {}; finish or release that work first, or retry with force only to stop its panes and remove it",
+            details.join("; ")
+        )
+    }
+}
+
 fn is_worktree_create_pending(error: &(String, String)) -> bool {
     error.1 == WORKTREE_CREATE_PENDING
 }
@@ -5819,7 +5879,7 @@ impl App {
         repo: &std::path::Path,
         path: &std::path::Path,
         force: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorktreeRemoveError> {
         let ready_matches = matches!(
             self.ready_worktree_provider.as_ref(),
             Some(crate::worktree::ProviderResult::Removed(ready))
@@ -5830,9 +5890,22 @@ impl App {
             self.finish_explicit_worktree_remove(path);
             return Ok(());
         }
+        if !force {
+            // Compare against the filesystem identity accepted by Git rather
+            // than the caller's spelling. Otherwise `../wt` or a symlink to an
+            // open worktree could bypass the in-use guard while the later Git
+            // removal resolves the same checkout.
+            let compared_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let blockers = self.worktree_remove_blockers(&compared_path);
+            if !blockers.is_empty() {
+                return Err(WorktreeRemoveError::InUse(blockers));
+            }
+        }
         if self.ready_worktree_provider.is_some() {
             self.discard_ready_worktree();
-            return Err("worktree target changed while the provider was running".into());
+            return Err(WorktreeRemoveError::Git(
+                "worktree target changed while the provider was running".into(),
+            ));
         }
         let branch = linked_worktree_branch(repo, path)?;
         if let Some(job) = crate::worktree::module_remove_job(
@@ -5849,10 +5922,12 @@ impl App {
             },
         )? {
             if self.worktree_provider_inflight || self.pending_worktree_provider.is_some() {
-                return Err("a worktree provider operation is already pending".into());
+                return Err("a worktree provider operation is already pending"
+                    .to_string()
+                    .into());
             }
             self.pending_worktree_provider = Some(job);
-            return Err(WORKTREE_REMOVE_PENDING.into());
+            return Err(WORKTREE_REMOVE_PENDING.to_string().into());
         }
         if force {
             crate::git::local::worktree_remove_force(repo, path)?;
@@ -5865,6 +5940,95 @@ impl App {
         cleanup_empty_worktree_parent(path);
         self.finish_explicit_worktree_remove(path);
         Ok(())
+    }
+
+    fn worktree_remove_blockers(&self, path: &std::path::Path) -> WorktreeRemoveBlockers {
+        use std::collections::BTreeSet;
+
+        let same_target = |candidate: &std::path::Path| {
+            crate::platform::same_path(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::same_path(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let inside_target = |candidate: &std::path::Path| {
+            crate::platform::is_subpath(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::is_subpath(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let mut target_panes = BTreeSet::new();
+        for workspace in &self.workspaces {
+            if same_target(&workspace.cwd) {
+                for pane in workspace.tabs.iter().flat_map(|tab| tab.layout.leaves()) {
+                    if self.panes.contains_key(&pane) {
+                        target_panes.insert(pane.0);
+                    }
+                }
+            }
+        }
+        for (&pane, terminal) in &self.panes {
+            if inside_target(&terminal.cwd) {
+                target_panes.insert(pane.0);
+            }
+        }
+
+        let panes = target_panes
+            .iter()
+            .filter_map(|pane| {
+                let pane = PaneId(*pane);
+                let status = self.status.get(&pane)?;
+                (self.is_agent_pane(pane)
+                    && matches!(status.state, State::Working | State::Blocked))
+                .then(|| {
+                    format!(
+                        "{}:{}:{}",
+                        pane.0,
+                        status.agent,
+                        crate::app::dispatch::state_str(status.state)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let target_tasks = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.worktree
+                    .as_deref()
+                    .is_some_and(|worktree| same_target(std::path::Path::new(worktree)))
+                    && !matches!(
+                        task.status,
+                        crate::orch::TaskStatus::Done | crate::orch::TaskStatus::Merged
+                    )
+            })
+            .map(|task| task.id.clone())
+            .collect::<BTreeSet<_>>();
+        let tasks = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| target_tasks.contains(&task.id))
+            .map(|task| format!("{}:{}", task.id, task.status.as_str()))
+            .collect::<Vec<_>>();
+
+        let leases = self
+            .orch
+            .leases
+            .iter()
+            .filter(|lease| {
+                target_panes.contains(&lease.pane) || target_tasks.contains(&lease.task)
+            })
+            .map(|lease| format!("{}:pane={}:task={}", lease.id, lease.pane, lease.task))
+            .collect::<Vec<_>>();
+
+        WorktreeRemoveBlockers {
+            panes,
+            tasks,
+            leases,
+        }
     }
 
     fn finish_explicit_worktree_remove(&mut self, path: &std::path::Path) {
@@ -6695,8 +6859,10 @@ impl App {
                     path.clone(),
                     identity,
                     move |app, result| {
-                        let result =
-                            result.and_then(|()| app.remove_worktree_explicit(&repo, &path, true));
+                        let result = result.and_then(|()| {
+                            app.remove_worktree_explicit(&repo, &path, true)
+                                .map_err(|error| error.to_string())
+                        });
                         app.finish_worktree_delete(&id, &path, result);
                         true
                     },
@@ -11121,6 +11287,107 @@ mod tests {
             wt.to_str().unwrap(),
         ]);
         (base, repo, wt)
+    }
+
+    #[test]
+    fn api_worktree_remove_protects_live_agent_task_and_lease() {
+        let _env = crate::persist::test_env("worktree-remove-in-use");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-in-use");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(worktree.clone()));
+        let workspace_id = app.ws().id.clone();
+        let pane = app.layout().focus;
+        let alternate_spelling = worktree.join("..").join("wt-feature");
+
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        let added = api_call(
+            &mut app,
+            "task.add",
+            json!({"title":"active worktree task", "workspace_id":workspace_id}),
+        );
+        assert_eq!(added["result"]["task"]["id"], "t1", "{added}");
+        let claimed = api_call(
+            &mut app,
+            "task.claim",
+            json!({"id":"t1", "pane":pane.0.to_string()}),
+        );
+        assert_eq!(claimed["result"]["task"]["status"], "claimed", "{claimed}");
+        app.orch.bind_worktree(
+            "t1",
+            Some(worktree.to_string_lossy().into_owned()),
+            Some("feature".into()),
+        );
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Running)
+            .unwrap();
+        let lease = api_call(
+            &mut app,
+            "lease.acquire",
+            json!({"task":"t1", "paths":["src/**"], "pane":pane.0.to_string()}),
+        );
+        assert_eq!(lease["result"]["lease"]["id"], "l1", "{lease}");
+
+        let refused = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":alternate_spelling}),
+        );
+        assert_eq!(refused["error"]["code"], "worktree_in_use", "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("{}:codex:working", pane.0)));
+        assert!(message.contains("t1:running"));
+        assert!(message.contains(&format!("l1:pane={}:task=t1", pane.0)));
+        assert!(
+            worktree.exists(),
+            "refusal happens before filesystem deletion"
+        );
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, Some(pane.0));
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Running
+        );
+        assert_eq!(app.orch.leases.len(), 1);
+
+        let unknown_field = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "recursive":true}),
+        );
+        assert_eq!(unknown_field["error"]["code"], "invalid_request");
+        let empty_path = api_call(&mut app, "worktree.remove", json!({"path":""}));
+        assert_eq!(empty_path["error"]["code"], "invalid_request");
+
+        let invalid_force = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":"yes"}),
+        );
+        assert_eq!(invalid_force["error"]["code"], "invalid_request");
+        assert!(worktree.exists());
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id));
+        assert!(app.orch.leases.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]

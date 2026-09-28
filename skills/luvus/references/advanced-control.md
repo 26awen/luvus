@@ -33,7 +33,9 @@ remains compatible with older Luvus releases.
 - Inspect the exact DIFF layer and file before changing or sending review notes.
   Removing notes and messaging an agent require explicit authorization.
 - List worktrees before creating, opening, or removing one. Removal requires
-  explicit authorization and an exact path.
+  explicit authorization and an exact path. A `worktree_in_use` response names
+  protected panes, tasks, and leases; use `--force` only with explicit approval
+  to stop that work and remove its checkout.
 - Inspect task and lease ownership, dependencies, gates, assignees, and path
   leases before claiming, starting, updating, completing, releasing, deleting,
   or merging. A merge is serialized through `luvus/integration`; wait for the

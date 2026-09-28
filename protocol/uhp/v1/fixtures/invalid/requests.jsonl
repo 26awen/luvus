@@ -40,3 +40,4 @@
 {"id":"bad-send-unknown-field","method":"agent.send","params":{"target":"7","text":"review","unknown":true}}
 {"id":"bad-task-retry-missing-id","method":"task.retry","params":{}}
 {"id":"bad-task-retry-extra","method":"task.retry","params":{"id":"t1","extra":true}}
+{"id":"bad-worktree-remove-force","method":"worktree.remove","params":{"path":"/workspace/topic","force":"yes"}}

@@ -333,4 +333,6 @@ finishes the superseded run as cancelled without closing its worker pane.
 | Scheduled worker still needs attention | ORCH marks the automation task `blocked` and records the detected prompt. Resolve it in the visible pane; Luvus does not approve unknown requests automatically. |
 
 Clean up a finished worker with `luvus worktree remove <path>` (the branch is
-kept).
+kept). Luvus refuses removal while a working or blocked agent pane, unfinished
+task, or lease still owns that worktree. Use `--force` only after explicitly
+confirming that those panes may be stopped and their worktree removed.

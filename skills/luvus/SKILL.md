@@ -448,7 +448,9 @@ surface:
   resolving, removing, applying, or sending a review note. Removing a note and
   sending feedback to an agent require explicit authorization.
 - List worktrees before creating, opening, or removing one. Removal requires
-  explicit authorization and an exact path.
+  explicit authorization and an exact path. If removal returns
+  `worktree_in_use`, report its panes, tasks, and leases. Never retry with
+  `--force` unless the user explicitly authorizes stopping that listed work.
 - Inspect task and lease ownership, dependencies, gates, assignees, and path
   leases before claiming, starting, updating, completing, releasing, deleting,
   or merging. `task merge` is serialized into
