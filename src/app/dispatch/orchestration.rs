@@ -3,6 +3,10 @@
 use super::*;
 use super::{params::*, projection::*};
 
+fn valid_worktree_remove_path(path: &str) -> bool {
+    !path.is_empty() && path.chars().count() <= 4096
+}
+
 impl App {
     // ── worktrees (docs/18 WT-3) ──
     pub(super) fn api_worktree_list(&mut self, method: &str, p: &Value) -> DispatchResult {
@@ -50,15 +54,36 @@ impl App {
     pub(super) fn api_worktree_remove(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
-            let path = param_path(p)?;
+            reject_api_fields(p, &["path", "force"])?;
+            let path = p
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| valid_worktree_remove_path(path))
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| {
+                    (
+                        "invalid_request".to_string(),
+                        "path must be a non-empty string of at most 4096 characters".to_string(),
+                    )
+                })?;
+            let force = match p.get("force") {
+                None => false,
+                Some(Value::Bool(force)) => *force,
+                Some(_) => {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "force must be a boolean".to_string(),
+                    ));
+                }
+            };
             // Run from the repo's **main** worktree — git refuses to remove a
             // worktree from inside it, and the active workspace may be unrelated.
             let repo = crate::git::local::worktrees(&path)
                 .ok()
                 .and_then(|wts| wts.into_iter().find(|w| w.is_main).map(|w| w.path))
                 .unwrap_or_else(|| self.ws().cwd.clone());
-            self.remove_worktree_explicit(&repo, &path, false)
-                .map_err(git_err)?;
+            self.remove_worktree_explicit(&repo, &path, force)
+                .map_err(WorktreeRemoveError::into_dispatch)?;
             Ok(json!({"type":"ok"}))
         }
     }
@@ -1228,5 +1253,17 @@ impl App {
                     "no pane id — run inside a luvus pane or pass a pane id".to_string(),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_worktree_remove_path;
+
+    #[test]
+    fn worktree_remove_path_limit_counts_unicode_characters() {
+        assert!(valid_worktree_remove_path("é"));
+        assert!(valid_worktree_remove_path(&"é".repeat(4096)));
+        assert!(!valid_worktree_remove_path(&"é".repeat(4097)));
     }
 }

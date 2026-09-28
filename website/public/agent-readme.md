@@ -135,6 +135,10 @@ Branch-backed dependencies unblock only after they are merged into the shared
 integration history.
 `task release` requeues active work and releases its path leases, but it does
 not stop the worker pane or discard its worktree.
+`worktree remove <path>` refuses to delete a worktree that still owns a working
+or blocked agent pane, unfinished task, or lease. Report the returned
+`worktree_in_use` blockers. Use `--force` only with explicit approval to stop
+that listed work and remove its checkout.
 `task retry <id>` queues a fresh attempt for terminal `done`, `failed`,
 `review`, or `blocked` work while preserving the old pane, branch, worktree,
 output, and notes. Inspect dependents first because retry is rejected after a

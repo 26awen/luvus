@@ -273,7 +273,7 @@ worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
-  worktree remove <path>     remove a worktree (its branch is kept)
+  worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
   task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]
@@ -3782,7 +3782,31 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("worktree", "create") => ("worktree.create".into(), one("branch", arg0())),
         ("worktree", "open") => ("worktree.open".into(), one("path", arg0())),
-        ("worktree", "remove") => ("worktree.remove".into(), one("path", arg0())),
+        ("worktree", "remove") => {
+            let usage = "usage: luvus worktree remove <path> [--force]";
+            let mut path = None;
+            let mut force = false;
+            for value in rest {
+                match value.as_str() {
+                    "--force" if !force => force = true,
+                    "--force" => return Err(anyhow!("--force may be passed only once")),
+                    option if option.starts_with("--") => {
+                        return Err(anyhow!(
+                            "unknown worktree remove option `{option}`. {usage}"
+                        ));
+                    }
+                    value if path.is_none() => path = Some(value.to_string()),
+                    _ => return Err(anyhow!(usage)),
+                }
+            }
+            let path = path.ok_or_else(|| anyhow!(usage))?;
+            let mut params = serde_json::Map::new();
+            params.insert("path".to_string(), json!(path));
+            if force {
+                params.insert("force".to_string(), json!(true));
+            }
+            ("worktree.remove".into(), Value::Object(params))
+        }
         ("worktree", _) => ("worktree.list".into(), json!({})),
 
         ("automation", "create") => {
@@ -6158,6 +6182,14 @@ mod tests {
         let (m, p) = parse(&argv("luvus worktree remove /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.remove");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force"), None);
+        let (m, p) = parse(&argv("luvus worktree remove --force /tmp/wt")).unwrap();
+        assert_eq!(m, "worktree.remove");
+        assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force").and_then(Value::as_bool), Some(true));
+        assert!(parse(&argv("luvus worktree remove")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/a /tmp/b")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/wt --unknown")).is_err());
     }
 
     #[test]

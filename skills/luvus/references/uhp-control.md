@@ -97,6 +97,9 @@ read current state and reconcile instead of blindly retrying.
 - Mission Control: read with `mission.snapshot`, refresh usage on demand with
   `mission.refresh`, and change the visible UI only with `mission.open`
 - Worktrees and orchestration: `worktree.*`, `task.*`, and `lease.*`
+  - `worktree.remove` refuses active agent, task, or lease ownership with
+    `worktree_in_use`. Send `force: true` only with explicit approval to stop
+    the listed work and remove its checkout.
 - Agent scheduling: inspect with `automation.list`, `automation.get`,
   `automation.history`, `automation.preview`, and `automation.health`; mutate
   with `automation.create`, `automation.update`, `automation.enable`,

@@ -692,6 +692,14 @@ def valid_global_request(value, methods):
             set(params) == {"id"}
             and bounded_string(params["id"], 128, allow_empty=False)
         )
+    if value["method"] == "worktree.remove":
+        params = value["params"]
+        return (
+            set(params) <= {"path", "force"}
+            and "path" in params
+            and bounded_string(params["path"], 4096, allow_empty=False)
+            and ("force" not in params or type(params["force"]) is bool)
+        )
     if value["method"] == "task.heartbeat":
         params = value["params"]
         context = params.get("context")

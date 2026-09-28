@@ -217,7 +217,7 @@ worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
-  worktree remove <path>     remove a worktree (its branch is kept)
+  worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
   task add "<title>" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]

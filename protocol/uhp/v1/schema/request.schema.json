@@ -244,6 +244,13 @@
         "id": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
+    "worktreeRemoveParams": {
+      "type": "object", "additionalProperties": false, "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "force": { "type": "boolean" }
+      }
+    },
     "taskStartParams": {
       "type": "object", "additionalProperties": false, "required": ["id"],
       "properties": {
@@ -428,6 +435,8 @@
       "then": { "properties": { "params": { "$ref": "#/$defs/taskUpdateParams" } } } },
     { "if": { "properties": { "method": { "const": "task.retry" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskRetryParams" } } } },
+    { "if": { "properties": { "method": { "const": "worktree.remove" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/worktreeRemoveParams" } } } },
     { "if": { "properties": { "method": { "const": "task.start" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskStartParams" } } } },
     { "if": { "properties": { "method": { "const": "task.next" } } },

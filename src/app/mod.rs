@@ -2309,6 +2309,88 @@ impl MenuScroll {
 pub const WORKTREE_CREATE_PENDING: &str = "__worktree_create_pending__";
 pub const WORKTREE_REMOVE_PENDING: &str = "__worktree_remove_pending__";
 
+#[derive(Debug)]
+pub(crate) enum WorktreeRemoveError {
+    InUse(WorktreeRemoveBlockers),
+    Git(String),
+}
+
+impl WorktreeRemoveError {
+    pub(crate) fn into_dispatch(self) -> (String, String) {
+        match self {
+            Self::InUse(blockers) => ("worktree_in_use".into(), blockers.message()),
+            Self::Git(message) => ("git_error".into(), message),
+        }
+    }
+}
+
+impl std::fmt::Display for WorktreeRemoveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUse(blockers) => formatter.write_str(&blockers.message()),
+            Self::Git(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for WorktreeRemoveError {
+    fn from(message: String) -> Self {
+        Self::Git(message)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct WorktreeRemoveBlockers {
+    panes: Vec<String>,
+    tasks: Vec<String>,
+    leases: Vec<String>,
+}
+
+struct WorktreeRemoveOwnership {
+    path: PathBuf,
+    aliases: std::collections::BTreeSet<PathBuf>,
+    outside: std::collections::BTreeSet<PathBuf>,
+}
+
+impl WorktreeRemoveOwnership {
+    fn contains(&self, candidate: &Path) -> bool {
+        if let Ok(resolved) = std::fs::canonicalize(candidate) {
+            return crate::platform::is_subpath(&resolved, &self.path);
+        }
+        // The deleted checkout may have held a symlink to an outside directory.
+        // Preserve its pre-delete classification when that link no longer resolves.
+        if self.outside.contains(candidate) {
+            return false;
+        }
+        self.aliases
+            .iter()
+            .any(|target| crate::platform::is_subpath(candidate, target))
+    }
+}
+
+impl WorktreeRemoveBlockers {
+    fn is_empty(&self) -> bool {
+        self.panes.is_empty() && self.tasks.is_empty() && self.leases.is_empty()
+    }
+
+    fn message(&self) -> String {
+        let mut details = Vec::new();
+        if !self.panes.is_empty() {
+            details.push(format!("panes [{}]", self.panes.join(", ")));
+        }
+        if !self.tasks.is_empty() {
+            details.push(format!("tasks [{}]", self.tasks.join(", ")));
+        }
+        if !self.leases.is_empty() {
+            details.push(format!("leases [{}]", self.leases.join(", ")));
+        }
+        format!(
+            "worktree is in use by {}; finish or release that work first, or retry with force only to stop its panes and remove it",
+            details.join("; ")
+        )
+    }
+}
+
 fn is_worktree_create_pending(error: &(String, String)) -> bool {
     error.1 == WORKTREE_CREATE_PENDING
 }
@@ -5819,7 +5901,7 @@ impl App {
         repo: &std::path::Path,
         path: &std::path::Path,
         force: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorktreeRemoveError> {
         let ready_matches = matches!(
             self.ready_worktree_provider.as_ref(),
             Some(crate::worktree::ProviderResult::Removed(ready))
@@ -5827,12 +5909,24 @@ impl App {
         );
         if ready_matches {
             self.ready_worktree_provider.take();
-            self.finish_explicit_worktree_remove(path);
             return Ok(());
+        }
+        let ownership = self.capture_worktree_remove_ownership(path);
+        if !force {
+            // Compare against the filesystem identity accepted by Git rather
+            // than the caller's spelling. Otherwise `../wt` or a symlink to an
+            // open worktree could bypass the in-use guard while the later Git
+            // removal resolves the same checkout.
+            let blockers = self.worktree_remove_blockers(&ownership.path);
+            if !blockers.is_empty() {
+                return Err(WorktreeRemoveError::InUse(blockers));
+            }
         }
         if self.ready_worktree_provider.is_some() {
             self.discard_ready_worktree();
-            return Err("worktree target changed while the provider was running".into());
+            return Err(WorktreeRemoveError::Git(
+                "worktree target changed while the provider was running".into(),
+            ));
         }
         let branch = linked_worktree_branch(repo, path)?;
         if let Some(job) = crate::worktree::module_remove_job(
@@ -5849,10 +5943,12 @@ impl App {
             },
         )? {
             if self.worktree_provider_inflight || self.pending_worktree_provider.is_some() {
-                return Err("a worktree provider operation is already pending".into());
+                return Err("a worktree provider operation is already pending"
+                    .to_string()
+                    .into());
             }
             self.pending_worktree_provider = Some(job);
-            return Err(WORKTREE_REMOVE_PENDING.into());
+            return Err(WORKTREE_REMOVE_PENDING.to_string().into());
         }
         if force {
             crate::git::local::worktree_remove_force(repo, path)?;
@@ -5863,17 +5959,159 @@ impl App {
             crate::git::local::worktree_remove(repo, path)?;
         }
         cleanup_empty_worktree_parent(path);
-        self.finish_explicit_worktree_remove(path);
+        self.finish_explicit_worktree_remove(ownership);
         Ok(())
     }
 
-    fn finish_explicit_worktree_remove(&mut self, path: &std::path::Path) {
-        if let Some(index) = self
+    /// Collect the live ownership that makes normal removal unsafe.
+    fn worktree_remove_blockers(&self, path: &std::path::Path) -> WorktreeRemoveBlockers {
+        use std::collections::BTreeSet;
+
+        let same_target = |candidate: &std::path::Path| {
+            crate::platform::same_path(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::same_path(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let target_panes = self.worktree_target_panes(path);
+        let panes = target_panes
+            .iter()
+            .filter_map(|pane| {
+                let pane = PaneId(*pane);
+                let status = self.status.get(&pane)?;
+                (self.is_agent_pane(pane)
+                    && matches!(status.state, State::Working | State::Blocked))
+                .then(|| {
+                    format!(
+                        "{}:{}:{}",
+                        pane.0,
+                        status.agent,
+                        crate::app::dispatch::state_str(status.state)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let target_tasks = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.worktree
+                    .as_deref()
+                    .is_some_and(|worktree| same_target(std::path::Path::new(worktree)))
+                    && !matches!(
+                        task.status,
+                        crate::orch::TaskStatus::Done | crate::orch::TaskStatus::Merged
+                    )
+            })
+            .map(|task| task.id.clone())
+            .collect::<BTreeSet<_>>();
+        let tasks = self
+            .orch
+            .tasks
+            .iter()
+            .filter(|task| target_tasks.contains(&task.id))
+            .map(|task| format!("{}:{}", task.id, task.status.as_str()))
+            .collect::<Vec<_>>();
+
+        let leases = self
+            .orch
+            .leases
+            .iter()
+            .filter(|lease| {
+                target_panes.contains(&lease.pane) || target_tasks.contains(&lease.task)
+            })
+            .map(|lease| format!("{}:pane={}:task={}", lease.id, lease.pane, lease.task))
+            .collect::<Vec<_>>();
+
+        WorktreeRemoveBlockers {
+            panes,
+            tasks,
+            leases,
+        }
+    }
+
+    /// Resolve every live pane whose filesystem context will disappear with a
+    /// worktree, including panes anchored in a different workspace.
+    fn worktree_target_panes(&self, path: &std::path::Path) -> std::collections::BTreeSet<u32> {
+        let same_target = |candidate: &std::path::Path| {
+            crate::platform::same_path(candidate, path)
+                || std::fs::canonicalize(candidate)
+                    .map(|candidate| crate::platform::same_path(&candidate, path))
+                    .unwrap_or(false)
+        };
+        let inside_target = |candidate: &std::path::Path| {
+            std::fs::canonicalize(candidate)
+                .map(|candidate| crate::platform::is_subpath(&candidate, path))
+                .unwrap_or_else(|_| crate::platform::is_subpath(candidate, path))
+        };
+        let mut target_panes = std::collections::BTreeSet::new();
+        for workspace in &self.workspaces {
+            if same_target(&workspace.cwd) {
+                for pane in workspace.tabs.iter().flat_map(|tab| tab.layout.leaves()) {
+                    if self.panes.contains_key(&pane) {
+                        target_panes.insert(pane.0);
+                    }
+                }
+            }
+        }
+        for (&pane, terminal) in &self.panes {
+            if inside_target(&terminal.cwd) {
+                target_panes.insert(pane.0);
+            }
+        }
+        target_panes
+    }
+
+    /// Resolve the target and snapshot all server-owned state before Git or a
+    /// provider makes filesystem identity checks impossible.
+    fn capture_worktree_remove_ownership(&self, path: &std::path::Path) -> WorktreeRemoveOwnership {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut aliases = std::collections::BTreeSet::from([path.to_path_buf(), canonical.clone()]);
+        let mut outside = std::collections::BTreeSet::new();
+        for cwd in self
             .workspaces
             .iter()
-            .position(|workspace| crate::platform::same_path(&workspace.cwd, path))
+            .map(|workspace| &workspace.cwd)
+            .chain(self.panes.values().map(|pane| &pane.cwd))
+        {
+            if let Ok(resolved) = std::fs::canonicalize(cwd) {
+                if crate::platform::is_subpath(&resolved, &canonical) {
+                    // Nested symlink aliases stop resolving after deletion.
+                    aliases.insert(cwd.clone());
+                } else {
+                    outside.insert(cwd.clone());
+                }
+            }
+        }
+        WorktreeRemoveOwnership {
+            path: canonical,
+            aliases,
+            outside,
+        }
+    }
+
+    /// Reconcile application ownership after Git or a provider has removed the
+    /// checkout. Panes may be anchored elsewhere while their cwd is inside it.
+    fn finish_explicit_worktree_remove(&mut self, ownership: WorktreeRemoveOwnership) {
+        while let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| ownership.contains(&workspace.cwd))
         {
             self.close_workspace(index);
+        }
+        let panes = self
+            .panes
+            .iter()
+            .filter(|(_, terminal)| ownership.contains(&terminal.cwd))
+            .map(|(pane, _)| *pane)
+            .collect::<Vec<_>>();
+        for pane in panes {
+            if self.panes.contains_key(&pane) {
+                self.close_pane(pane);
+            }
         }
     }
 
@@ -6695,8 +6933,10 @@ impl App {
                     path.clone(),
                     identity,
                     move |app, result| {
-                        let result =
-                            result.and_then(|()| app.remove_worktree_explicit(&repo, &path, true));
+                        let result = result.and_then(|()| {
+                            app.remove_worktree_explicit(&repo, &path, true)
+                                .map_err(|error| error.to_string())
+                        });
                         app.finish_worktree_delete(&id, &path, result);
                         true
                     },
@@ -11123,6 +11363,294 @@ mod tests {
         (base, repo, wt)
     }
 
+    #[test]
+    fn api_worktree_remove_protects_live_agent_task_and_lease() {
+        let _env = crate::persist::test_env("worktree-remove-in-use");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-in-use");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(worktree.clone()));
+        let workspace_id = app.ws().id.clone();
+        let pane = app.layout().focus;
+        let alternate_spelling = worktree.join("..").join("wt-feature");
+
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        let added = api_call(
+            &mut app,
+            "task.add",
+            json!({"title":"active worktree task", "workspace_id":workspace_id}),
+        );
+        assert_eq!(added["result"]["task"]["id"], "t1", "{added}");
+        let claimed = api_call(
+            &mut app,
+            "task.claim",
+            json!({"id":"t1", "pane":pane.0.to_string()}),
+        );
+        assert_eq!(claimed["result"]["task"]["status"], "claimed", "{claimed}");
+        app.orch.bind_worktree(
+            "t1",
+            Some(worktree.to_string_lossy().into_owned()),
+            Some("feature".into()),
+        );
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Running)
+            .unwrap();
+        let lease = api_call(
+            &mut app,
+            "lease.acquire",
+            json!({"task":"t1", "paths":["src/**"], "pane":pane.0.to_string()}),
+        );
+        assert_eq!(lease["result"]["lease"]["id"], "l1", "{lease}");
+
+        let refused = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":alternate_spelling}),
+        );
+        assert_eq!(refused["error"]["code"], "worktree_in_use", "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&format!("{}:codex:working", pane.0)));
+        assert!(message.contains("t1:running"));
+        assert!(message.contains(&format!("l1:pane={}:task=t1", pane.0)));
+        assert!(
+            worktree.exists(),
+            "refusal happens before filesystem deletion"
+        );
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, Some(pane.0));
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Running
+        );
+        assert_eq!(app.orch.leases.len(), 1);
+
+        let unknown_field = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "recursive":true}),
+        );
+        assert_eq!(unknown_field["error"]["code"], "invalid_request");
+        let empty_path = api_call(&mut app, "worktree.remove", json!({"path":""}));
+        assert_eq!(empty_path["error"]["code"], "invalid_request");
+
+        let invalid_force = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":"yes"}),
+        );
+        assert_eq!(invalid_force["error"]["code"], "invalid_request");
+        assert!(worktree.exists());
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree.join("..").join("wt-feature"), "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id));
+        assert!(app.orch.leases.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn forced_worktree_remove_closes_cross_workspace_pane_in_deleted_cwd() {
+        let _env = crate::persist::test_env("worktree-remove-cross-workspace");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-cross-workspace");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let workspace_id = app.ws().id.clone();
+        let stable_pane = app.layout().focus;
+        let cross_workspace_pane = app
+            .split_pane(stable_pane, Axis::Col, true)
+            .expect("split pane");
+        let nested_cwd = worktree.join("nested");
+        std::fs::create_dir_all(&nested_cwd).unwrap();
+        app.panes.get_mut(&cross_workspace_pane).unwrap().cwd = nested_cwd;
+
+        assert!(app.create_workspace_at(worktree.clone()));
+        let removed_workspace_id = app.ws().id.clone();
+        let status = app.status.get_mut(&cross_workspace_pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        let added = api_call(
+            &mut app,
+            "task.add",
+            json!({"title":"cross workspace worker", "workspace_id":workspace_id}),
+        );
+        assert_eq!(added["result"]["task"]["id"], "t1", "{added}");
+        let claimed = api_call(
+            &mut app,
+            "task.claim",
+            json!({"id":"t1", "pane":cross_workspace_pane.0.to_string()}),
+        );
+        assert_eq!(claimed["result"]["task"]["status"], "claimed", "{claimed}");
+        app.orch
+            .set_status("t1", crate::orch::TaskStatus::Running)
+            .unwrap();
+        let lease = api_call(
+            &mut app,
+            "lease.acquire",
+            json!({
+                "task":"t1",
+                "paths":["src/**"],
+                "pane":cross_workspace_pane.0.to_string()
+            }),
+        );
+        assert_eq!(lease["result"]["lease"]["id"], "l1", "{lease}");
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree.join("..").join("wt-feature"), "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(app.panes.contains_key(&stable_pane));
+        assert!(!app.panes.contains_key(&cross_workspace_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == removed_workspace_id));
+        assert_eq!(app.orch.task("t1").unwrap().assignee, None);
+        assert!(app.orch.leases.is_empty());
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_preserves_pane_through_outbound_symlink() {
+        let _env = crate::persist::test_env("worktree-remove-outbound-symlink");
+        let (base, _repo, worktree) =
+            repo_with_sibling_worktree("worktree-remove-outbound-symlink");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = worktree.join("outside-link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable = app.layout().focus;
+        let outside_pane = app.split_pane(stable, Axis::Col, true).unwrap();
+        app.panes.get_mut(&outside_pane).unwrap().cwd = link;
+        let status = app.status.get_mut(&outside_pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+
+        assert!(app.worktree_remove_blockers(&worktree).is_empty());
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(outside.exists());
+        assert!(app.panes.contains_key(&outside_pane));
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_closes_nested_symlink_owners() {
+        let _env = crate::persist::test_env("worktree-remove-nested-symlink");
+        let (base, _repo, worktree) = repo_with_sibling_worktree("worktree-remove-nested-symlink");
+        let nested = worktree.join("nested");
+        std::fs::create_dir_all(nested.join("child")).unwrap();
+        let alias = base.join("nested-alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable = app.layout().focus;
+        let cross_workspace_pane = app.split_pane(stable, Axis::Col, true).unwrap();
+        app.panes.get_mut(&cross_workspace_pane).unwrap().cwd = alias.join("child");
+        assert!(app.create_workspace_at(worktree.clone()));
+        let removed_workspace = app.ws().id.clone();
+        let removed_pane = app.layout().focus;
+        app.workspaces[app.active_ws].cwd = alias.clone();
+        app.panes.get_mut(&removed_pane).unwrap().cwd = alias;
+
+        let forced = api_call(
+            &mut app,
+            "worktree.remove",
+            json!({"path":worktree, "force":true}),
+        );
+        assert_eq!(forced["result"]["type"], "ok", "{forced}");
+        assert!(!worktree.exists());
+        assert!(app.panes.contains_key(&stable));
+        assert!(!app.panes.contains_key(&cross_workspace_pane));
+        assert!(!app.panes.contains_key(&removed_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == removed_workspace));
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn worktree_remove_completion_reconciles_changed_ownership() {
+        let _env = crate::persist::test_env("worktree-remove-reconcile-ownership");
+        let (base, repo, worktree) =
+            repo_with_sibling_worktree("worktree-remove-reconcile-ownership");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable_pane = app.layout().focus;
+
+        assert!(app.create_workspace_at(worktree.clone()));
+        let moved_workspace = app.ws().id.clone();
+        let moved_pane = app.layout().focus;
+        let ownership = app.capture_worktree_remove_ownership(&worktree);
+
+        app.workspaces[app.active_ws].cwd = outside.clone();
+        app.panes.get_mut(&moved_pane).unwrap().cwd = outside;
+        app.active_ws = 0;
+        let entered_pane = app
+            .split_pane(stable_pane, Axis::Col, true)
+            .expect("split pane");
+        app.panes.get_mut(&entered_pane).unwrap().cwd = worktree.join("nested");
+        assert!(app.create_workspace_at(worktree.clone()));
+        let entered_workspace = app.ws().id.clone();
+
+        crate::git::local::worktree_remove_force(&repo, &worktree).unwrap();
+        app.finish_explicit_worktree_remove(ownership);
+
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == moved_workspace));
+        assert!(app.panes.contains_key(&moved_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == entered_workspace));
+        assert!(!app.panes.contains_key(&entered_pane));
+        assert!(app.panes.contains_key(&stable_pane));
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn api_worktree_create_uses_configured_module_provider() {
@@ -11306,6 +11834,7 @@ fi
             .unwrap()
             .id
             .clone();
+        let alternate_topic = path.join("..").join("wt-topic");
         assert!(path.exists(), "topic worktree still exists before removal");
         let listed = crate::git::local::worktrees(&repo).unwrap();
         let canonical_topic = std::fs::canonicalize(&path).unwrap();
@@ -11322,7 +11851,7 @@ fi
             &mut app,
             &events,
             "worktree.remove",
-            serde_json::json!({"path":path}),
+            serde_json::json!({"path":alternate_topic}),
         );
         assert_eq!(removed["result"]["type"], "ok", "{removed}");
         assert!(!path.exists());
@@ -11345,7 +11874,7 @@ fi
         );
         assert_eq!(
             std::path::Path::new(remove_request["path"].as_str().unwrap()),
-            std::path::Path::new(&path),
+            std::path::Path::new(&alternate_topic),
         );
         assert_eq!(remove_request["branch"], "topic");
         assert_eq!(remove_request["force"], false);
