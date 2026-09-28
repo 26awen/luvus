@@ -128,8 +128,22 @@ pub fn spawn(
     env: Vec<(String, String)>,
     app_tx: Sender<AppEvent>,
 ) {
+    spawn_with_input(log_id, root, argv, env, None, app_tx);
+}
+
+/// Commander-only variant: write one bounded JSON document to stdin. Other
+/// action entrypoints still receive a closed stdin and unchanged argv/env.
+pub fn spawn_with_input(
+    log_id: u64,
+    root: PathBuf,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    input: Option<Vec<u8>>,
+    app_tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
-        let (code, out, err) = run(&root, &argv, &env, None, None);
+        let timeout = input.as_ref().map(|_| SYNC_TIMEOUT);
+        let (code, out, err) = run_with_input(&root, &argv, &env, input, timeout, None);
         let _ = app_tx.send(AppEvent::ModuleCommandFinished {
             log_id,
             code,

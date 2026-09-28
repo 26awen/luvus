@@ -1467,6 +1467,7 @@ fn draw_commander(
     }
     if commander.focused && app.commander_accepts_input() {
         draw_commander_slash_preview(f, rect, app.last_pane_area.y, commander, cat, t);
+        draw_commander_module_preview(f, rect, app.last_pane_area.y, commander, cat, t);
     }
     Some((
         inner.x + (2 + cursor_column).min(inner.width.saturating_sub(1) as usize) as u16,
@@ -1548,6 +1549,104 @@ fn draw_commander_slash_preview(
         } else {
             format!("{} {}", spec.name, spec.usage)
         };
+        let position = format!("{}/{}", selected + 1, matches.len());
+        let position_width = position.len() as u16;
+        let usage_width = popup.width.saturating_sub(position_width + 4);
+        f.render_widget(
+            Paragraph::new(truncate(&usage, usage_width as usize))
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.bottom() - 2, usage_width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(position).style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(
+                popup.right() - position_width - 1,
+                popup.bottom() - 2,
+                position_width,
+                1,
+            ),
+        );
+    }
+}
+
+fn draw_commander_module_preview(
+    f: &mut RenderTarget,
+    strip: Rect,
+    pane_top: u16,
+    commander: &crate::commander::Commander,
+    cat: &crate::i18n::Catalog,
+    t: &Theme,
+) {
+    let Some((matches, selected)) = commander.module_menu() else {
+        return;
+    };
+    let Some((popup, visible)) =
+        crate::commander::slash_popup_layout(strip, pane_top, matches.len())
+    else {
+        return;
+    };
+    f.render_widget(
+        Block::bordered()
+            .border_type(BorderType::Plain)
+            .title(Span::styled(
+                format!(" {} ", cat.commander_slash_title),
+                Style::new().fg(t.accent).bold(),
+            ))
+            .border_style(Style::new().fg(t.border_focus))
+            .style(Style::new().bg(t.mantle).fg(t.text)),
+        popup,
+    );
+    let first = crate::commander::slash_window_start(selected, matches.len(), visible);
+    for (row, entry) in matches.iter().skip(first).take(visible).enumerate() {
+        let active = first + row == selected;
+        let line = format!(
+            "{} {} · {} · {}",
+            if active { "›" } else { " " },
+            entry.command,
+            entry.spec.title,
+            entry.spec.module_name
+        );
+        f.render_widget(
+            Paragraph::new(truncate(&line, popup.width.saturating_sub(4) as usize)).style(
+                Style::new()
+                    .bg(if active { t.surface0 } else { t.mantle })
+                    .fg(if active { t.accent } else { t.text }),
+            ),
+            Rect::new(popup.x + 1, popup.y + 1 + row as u16, popup.width - 2, 1),
+        );
+    }
+    if first > 0 {
+        f.render_widget(
+            Paragraph::new("↑").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + 1, 1, 1),
+        );
+    }
+    if first + visible < matches.len() {
+        f.render_widget(
+            Paragraph::new("↓").style(Style::new().bg(t.mantle).fg(t.accent)),
+            Rect::new(popup.right() - 2, popup.y + visible as u16, 1, 1),
+        );
+    }
+    if matches.is_empty() {
+        f.render_widget(
+            Paragraph::new(cat.commander_slash_no_match)
+                .style(Style::new().bg(t.mantle).fg(t.overlay1)),
+            Rect::new(popup.x + 1, popup.y + 1, popup.width - 2, 1),
+        );
+    }
+    if let Some(entry) = matches.get(selected) {
+        let target = match entry.spec.target {
+            crate::module::manifest::CommanderTarget::None => "",
+            crate::module::manifest::CommanderTarget::Pane => " @pane",
+            crate::module::manifest::CommanderTarget::Agent => " @agent-pane",
+            crate::module::manifest::CommanderTarget::Tab => " @tab:name",
+            crate::module::manifest::CommanderTarget::Workspace => " @workspace:name",
+        };
+        let input = match entry.spec.input {
+            crate::module::manifest::CommanderInput::None => "",
+            crate::module::manifest::CommanderInput::Text => " [text]",
+        };
+        let usage = format!("{}{}{}", entry.command, target, input);
         let position = format!("{}/{}", selected + 1, matches.len());
         let position_width = position.len() as u16;
         let usage_width = popup.width.saturating_sub(position_width + 4);

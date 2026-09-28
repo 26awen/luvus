@@ -30,6 +30,11 @@ pub(crate) struct Commander {
     pub(crate) read_scroll: usize,
     /// Picker selection is independent of the typed slash name while browsing.
     pub(crate) slash_selection: Option<usize>,
+    /// Only refreshed on open or module-registry mutation, never by painting.
+    pub(crate) module_commands: Vec<super::ModuleCommandSpec>,
+    pub(crate) module_selection: Option<usize>,
+    pub(crate) pending_module_confirmation: Option<super::modules::ModuleInvocation>,
+    pub(crate) running_module: Option<(u64, String)>,
     /// A Tab-selected target or field choice awaits Space/Enter confirmation.
     pub(crate) pending_completion: bool,
     /// UTC identity of a Tab-suggested one-time schedule, until that value is edited.
@@ -153,6 +158,8 @@ impl Commander {
         self.read_output = None;
         self.read_scroll = 0;
         self.slash_selection = None;
+        self.module_selection = None;
+        self.pending_module_confirmation = None;
     }
 
     pub(crate) fn insert(&mut self, input: &str) -> bool {

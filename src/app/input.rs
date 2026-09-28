@@ -1450,7 +1450,11 @@ impl App {
         // The strip is persistent, not modal. Its own hitbox focuses editing;
         // clicks outside hand the event to normal tab/sidebar/pane hit testing.
         if self.commander_accepts_mouse_focus() {
-            if let Some((popup, first, count)) = self.commander_slash_popup() {
+            if let Some((popup, first, count)) = self
+                .commander_slash_popup()
+                .or_else(|| self.commander_module_popup())
+            {
+                let module_popup = self.commander_module_popup().is_some();
                 let inside_popup = m.column >= popup.x
                     && m.column < popup.right()
                     && m.row >= popup.y
@@ -1458,11 +1462,19 @@ impl App {
                 if inside_popup {
                     match kind {
                         MouseEventKind::ScrollUp => {
-                            self.commander_move_slash_selection(-1);
+                            if module_popup {
+                                self.commander_move_module_selection(-1);
+                            } else {
+                                self.commander_move_slash_selection(-1);
+                            }
                             return true;
                         }
                         MouseEventKind::ScrollDown => {
-                            self.commander_move_slash_selection(1);
+                            if module_popup {
+                                self.commander_move_module_selection(1);
+                            } else {
+                                self.commander_move_slash_selection(1);
+                            }
                             return true;
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -1471,7 +1483,11 @@ impl App {
                                 let index = first + row;
                                 if index < count {
                                     if let Some(commander) = self.commander.as_mut() {
-                                        commander.slash_selection = Some(index);
+                                        if module_popup {
+                                            commander.module_selection = Some(index);
+                                        } else {
+                                            commander.slash_selection = Some(index);
+                                        }
                                         commander.focused = true;
                                     }
                                 }

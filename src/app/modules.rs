@@ -65,6 +65,7 @@ impl App {
         self.module_tokens.insert(id.clone(), token);
         registry::save(&self.modules);
         self.bar.sync_modules(&self.modules);
+        self.refresh_commander_module_catalog();
         // A freshly linked module gets its startup hooks now rather than at the
         // next restart, so its docks and bar widgets appear immediately.
         self.run_module_startup_hooks();
@@ -94,6 +95,7 @@ impl App {
         self.clear_agent_row_titles_for_owner(id);
         self.module_tokens.remove(id);
         self.bar.sync_modules(&self.modules);
+        self.refresh_commander_module_catalog();
         Ok(())
     }
 
@@ -112,6 +114,7 @@ impl App {
         self.clear_agent_row_titles_for_owner(id);
         self.module_tokens.remove(id);
         self.bar.sync_modules(&self.modules);
+        self.refresh_commander_module_catalog();
         Ok(())
     }
 
@@ -152,6 +155,7 @@ impl App {
             self.bar.sync_modules(&self.modules);
             self.run_module_startup_hooks();
         }
+        self.refresh_commander_module_catalog();
         Ok(())
     }
 
@@ -621,6 +625,48 @@ impl App {
         source: &str,
         target: Target,
     ) -> Result<u64, String> {
+        self.run_module_command_for_with_input(
+            module_id,
+            argv,
+            label,
+            extra_env,
+            (source, target),
+            None,
+        )
+    }
+
+    pub(crate) fn run_module_command_for_input(
+        &mut self,
+        module_id: &str,
+        argv: Vec<String>,
+        label: String,
+        extra_env: Vec<(String, String)>,
+        source_target: (&str, Target),
+        input: Vec<u8>,
+    ) -> Result<u64, String> {
+        if input.len() > crate::commander::MAX_INVOCATION_BYTES {
+            return Err("Module command input exceeds 64 KiB".into());
+        }
+        self.run_module_command_for_with_input(
+            module_id,
+            argv,
+            label,
+            extra_env,
+            source_target,
+            Some(input),
+        )
+    }
+
+    fn run_module_command_for_with_input(
+        &mut self,
+        module_id: &str,
+        argv: Vec<String>,
+        label: String,
+        extra_env: Vec<(String, String)>,
+        source_target: (&str, Target),
+        input: Option<Vec<u8>>,
+    ) -> Result<u64, String> {
+        let (source, target) = source_target;
         let module_id = self.module_id_for(module_id)?;
         {
             let module = self
@@ -668,7 +714,11 @@ impl App {
             out: String::new(),
             err: String::new(),
         });
-        runtime::spawn(log_id, root, argv, env, self.app_tx.clone());
+        if let Some(input) = input {
+            runtime::spawn_with_input(log_id, root, argv, env, Some(input), self.app_tx.clone());
+        } else {
+            runtime::spawn(log_id, root, argv, env, self.app_tx.clone());
+        }
         Ok(log_id)
     }
 
@@ -688,8 +738,19 @@ impl App {
         out: String,
         err: String,
     ) {
+        let succeeded = code == Some(0);
+        let detail: String = if succeeded {
+            String::new()
+        } else {
+            err.lines()
+                .next()
+                .unwrap_or("command failed")
+                .chars()
+                .take(120)
+                .collect()
+        };
         if let Some(log) = self.module_logs.iter_mut().find(|l| l.id == log_id) {
-            log.status = if code == Some(0) {
+            log.status = if succeeded {
                 ModuleStatus::Succeeded
             } else {
                 ModuleStatus::Failed
@@ -697,6 +758,24 @@ impl App {
             log.code = code;
             log.out = out;
             log.err = err;
+        }
+        if let Some(commander) = self.commander.as_mut() {
+            if let Some((running, label)) = commander.running_module.as_ref() {
+                if *running == log_id {
+                    if commander.draft.is_empty() {
+                        let outcome = if succeeded { "succeeded" } else { "failed" };
+                        commander.receipt = Some(format!(
+                            "{label} {outcome} · log {log_id}{}",
+                            if detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {detail}")
+                            }
+                        ));
+                    }
+                    commander.running_module = None;
+                }
+            }
         }
     }
 }

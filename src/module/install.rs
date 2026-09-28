@@ -193,6 +193,15 @@ fn preview_commands(m: &ModuleManifest) -> Vec<String> {
     }
     for a in &m.actions {
         commands.push(format!("  action {}: {}", a.id, format_argv(&a.command)));
+        if let Some(commander) = &a.commander {
+            commands.push(format!(
+                "    Commander ${}: target={} input={} confirmation={}",
+                commander.name,
+                commander.target.as_str(),
+                commander.input.as_str(),
+                commander.confirmation.as_str()
+            ));
+        }
     }
     for p in &m.panes {
         commands.push(format!("  pane {}: {}", p.id, format_argv(&p.command)));
@@ -344,6 +353,28 @@ remove_command = ["./remove-worktree"]
         assert!(commands
             .iter()
             .any(|line| line.contains("worktree removal provider: \"./remove-worktree\"")));
+    }
+
+    #[test]
+    fn install_preview_shows_commander_exposure_and_policy() {
+        let manifest: ModuleManifest = toml::from_str(
+            r#"id = "example.review"
+name = "Review"
+version = "0.1.0"
+min_luvus_version = "0.1.0"
+[[actions]]
+id = "review"
+title = "Review a pane"
+command = ["python3", "review.py"]
+commander = { name = "review", target = "pane", input = "text" }
+"#,
+        )
+        .unwrap();
+        let lines = preview_commands(&manifest);
+        assert!(lines.iter().any(|line| line.contains("action review:")));
+        assert!(lines.iter().any(|line| {
+            line.contains("Commander $review: target=pane input=text confirmation=required")
+        }));
     }
 
     #[test]
