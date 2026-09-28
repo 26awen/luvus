@@ -2348,8 +2348,18 @@ pub(crate) struct WorktreeRemoveBlockers {
 
 struct WorktreeRemoveOwnership {
     path: PathBuf,
-    workspace_ids: std::collections::BTreeSet<String>,
-    panes: std::collections::BTreeSet<u32>,
+    aliases: std::collections::BTreeSet<PathBuf>,
+}
+
+impl WorktreeRemoveOwnership {
+    fn contains(&self, candidate: &Path) -> bool {
+        self.aliases
+            .iter()
+            .any(|target| crate::platform::is_subpath(candidate, target))
+            || std::fs::canonicalize(candidate)
+                .map(|candidate| crate::platform::is_subpath(&candidate, &self.path))
+                .unwrap_or(false)
+    }
 }
 
 impl WorktreeRemoveBlockers {
@@ -6052,40 +6062,40 @@ impl App {
     /// Resolve the target and snapshot all server-owned state before Git or a
     /// provider makes filesystem identity checks impossible.
     fn capture_worktree_remove_ownership(&self, path: &std::path::Path) -> WorktreeRemoveOwnership {
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let workspace_ids = self
-            .workspaces
-            .iter()
-            .filter(|workspace| {
-                crate::platform::same_path(&workspace.cwd, &path)
-                    || std::fs::canonicalize(&workspace.cwd)
-                        .map(|candidate| crate::platform::same_path(&candidate, &path))
-                        .unwrap_or(false)
-            })
-            .map(|workspace| workspace.id.clone())
-            .collect();
-        let panes = self.worktree_target_panes(&path);
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut aliases = std::collections::BTreeSet::from([path.to_path_buf(), canonical.clone()]);
+        for workspace in &self.workspaces {
+            if crate::platform::same_path(&workspace.cwd, &canonical)
+                || std::fs::canonicalize(&workspace.cwd)
+                    .map(|candidate| crate::platform::same_path(&candidate, &canonical))
+                    .unwrap_or(false)
+            {
+                aliases.insert(workspace.cwd.clone());
+            }
+        }
         WorktreeRemoveOwnership {
-            path,
-            workspace_ids,
-            panes,
+            path: canonical,
+            aliases,
         }
     }
 
     /// Reconcile application ownership after Git or a provider has removed the
     /// checkout. Panes may be anchored elsewhere while their cwd is inside it.
     fn finish_explicit_worktree_remove(&mut self, ownership: WorktreeRemoveOwnership) {
-        for workspace_id in ownership.workspace_ids {
-            if let Some(index) = self
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.id == workspace_id)
-            {
-                self.close_workspace(index);
-            }
+        while let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| ownership.contains(&workspace.cwd))
+        {
+            self.close_workspace(index);
         }
-        for pane in ownership.panes {
-            let pane = PaneId(pane);
+        let panes = self
+            .panes
+            .iter()
+            .filter(|(_, terminal)| ownership.contains(&terminal.cwd))
+            .map(|(pane, _)| *pane)
+            .collect::<Vec<_>>();
+        for pane in panes {
             if self.panes.contains_key(&pane) {
                 self.close_pane(pane);
             }
@@ -11508,6 +11518,51 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn worktree_remove_completion_reconciles_changed_ownership() {
+        let _env = crate::persist::test_env("worktree-remove-reconcile-ownership");
+        let (base, repo, worktree) =
+            repo_with_sibling_worktree("worktree-remove-reconcile-ownership");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let stable_pane = app.layout().focus;
+
+        assert!(app.create_workspace_at(worktree.clone()));
+        let moved_workspace = app.ws().id.clone();
+        let moved_pane = app.layout().focus;
+        let ownership = app.capture_worktree_remove_ownership(&worktree);
+
+        app.workspaces[app.active_ws].cwd = outside.clone();
+        app.panes.get_mut(&moved_pane).unwrap().cwd = outside;
+        app.active_ws = 0;
+        let entered_pane = app
+            .split_pane(stable_pane, Axis::Col, true)
+            .expect("split pane");
+        app.panes.get_mut(&entered_pane).unwrap().cwd = worktree.join("nested");
+        assert!(app.create_workspace_at(worktree.clone()));
+        let entered_workspace = app.ws().id.clone();
+
+        crate::git::local::worktree_remove_force(&repo, &worktree).unwrap();
+        app.finish_explicit_worktree_remove(ownership);
+
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == moved_workspace));
+        assert!(app.panes.contains_key(&moved_pane));
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == entered_workspace));
+        assert!(!app.panes.contains_key(&entered_pane));
+        assert!(app.panes.contains_key(&stable_pane));
+
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn api_worktree_create_uses_configured_module_provider() {
@@ -11691,13 +11746,6 @@ fi
             .unwrap()
             .id
             .clone();
-        let stable_pane = app.layout().focus;
-        let cross_workspace_pane = app
-            .split_pane(stable_pane, Axis::Col, true)
-            .expect("split pane");
-        let nested_topic = path.join("nested");
-        std::fs::create_dir_all(&nested_topic).unwrap();
-        app.panes.get_mut(&cross_workspace_pane).unwrap().cwd = nested_topic;
         let alternate_topic = path.join("..").join("wt-topic");
         assert!(path.exists(), "topic worktree still exists before removal");
         let listed = crate::git::local::worktrees(&repo).unwrap();
@@ -11723,8 +11771,6 @@ fi
             .workspaces
             .iter()
             .any(|workspace| workspace.id == topic_workspace));
-        assert!(app.panes.contains_key(&stable_pane));
-        assert!(!app.panes.contains_key(&cross_workspace_pane));
         let remove_request: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 crate::module::paths::state_dir("example.worktree").join("remove-request.json"),
