@@ -826,6 +826,8 @@ fn slash_key_and_tab_complete_the_action_before_a_target() {
     let (tx, _) = std::sync::mpsc::channel();
     let mut app = App::new(80, 24, tx).unwrap();
     app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert!(app.commander.as_ref().unwrap().draft.is_empty());
     app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     assert_eq!(app.commander.as_ref().unwrap().draft, "/");
     app.commander_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -846,11 +848,46 @@ fn slash_key_and_tab_complete_the_action_before_a_target() {
 }
 
 #[test]
+fn slash_after_target_stays_literal_and_reaches_the_pane() {
+    let _env = crate::persist::test_env("commander-targeted-slash");
+    let (tx, _) = std::sync::mpsc::channel();
+    let mut app = App::new(80, 24, tx).unwrap();
+    let pane = app.layout().focus;
+    app.status.get_mut(&pane).unwrap().agent = "zsh".into();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    app.panes
+        .get_mut(&pane)
+        .unwrap()
+        .replace_input_sender_for_test(input_tx);
+
+    app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(
+        app.commander.as_ref().unwrap().draft,
+        format!("@p{} /", pane.0)
+    );
+    app.commander_paste("status");
+    app.commander_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let crate::terminal::pty::InputAction::Submit { paste, .. } = input_rx.try_recv().unwrap()
+    else {
+        panic!("targeted slash command must reach the pane");
+    };
+    assert_eq!(String::from_utf8_lossy(&paste), "/status");
+
+    let commander = app.commander.as_mut().unwrap();
+    commander.clear_all();
+    commander.insert("@reviewer ");
+    app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(app.commander.as_ref().unwrap().draft, "@reviewer /");
+}
+
+#[test]
 fn slash_enter_accepts_a_suggestion_before_dispatching() {
     let _env = crate::persist::test_env("commander-slash-enter");
     let (tx, _) = std::sync::mpsc::channel();
     let mut app = App::new(80, 24, tx).unwrap();
     app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     app.commander_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     app.commander_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
@@ -871,6 +908,7 @@ fn slash_picker_arrows_pages_and_enter_select_without_editing_the_draft() {
     let (tx, _) = std::sync::mpsc::channel();
     let mut app = App::new(80, 24, tx).unwrap();
     app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     for _ in 0..8 {
         app.commander_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -899,6 +937,7 @@ fn slash_picker_mouse_wheel_and_row_click_stay_out_of_underlying_panes() {
     let mut app = App::new(80, 24, tx).unwrap();
     let pane = app.layout().focus;
     app.open_commander();
+    app.commander_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     app.commander_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     app.commander_area = Some(Rect::new(3, 20, 74, 4));
     app.last_pane_area = Rect::new(3, 11, 74, 9);

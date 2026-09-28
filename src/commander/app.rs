@@ -322,25 +322,6 @@ impl App {
                 }
             }
         }
-        if key.code == KeyCode::Char('/')
-            && !key.modifiers.intersects(
-                KeyModifiers::CONTROL
-                    | KeyModifiers::ALT
-                    | KeyModifiers::SUPER
-                    | KeyModifiers::META,
-            )
-        {
-            let focused = self.layout().focus;
-            let commander = self.commander.as_mut().unwrap();
-            if commander.cursor == commander.draft.len()
-                && commander.draft == format!("@p{} ", focused.0)
-            {
-                commander.clear_all();
-                commander.insert("/");
-                self.refresh_commander_preview();
-                return true;
-            }
-        }
         let commander = self.commander.as_mut().unwrap();
         let control = is_ctrl_chord(key.modifiers);
         let alt = key.modifiers.contains(KeyModifiers::ALT)
