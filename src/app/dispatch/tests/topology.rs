@@ -288,6 +288,68 @@ fn stable_topology_ids_survive_reordering_and_address_mutations() {
 }
 
 #[test]
+fn pane_list_all_tabs_discovers_inactive_panes_without_changing_focus() {
+    let (_env, mut app) = app("pane-list-all-tabs");
+    let first = app.layout().focus;
+    let first_workspace_id = app.workspaces[0].id.clone();
+    let first_tab_id = app.workspaces[0].tabs[0].id.clone();
+
+    app.dispatch("tab.new", &json!({})).unwrap();
+    let second = app.layout().focus;
+    let second_tab_id = app.workspaces[0].tabs[1].id.clone();
+    app.dispatch("workspace.new", &json!({})).unwrap();
+    let third = app.layout().focus;
+    let active_workspace = app.active_ws;
+    let active_focus = app.layout().focus;
+
+    let scoped = app
+        .dispatch("pane.list", &json!({"all_tabs": false}))
+        .unwrap();
+    assert_eq!(scoped["panes"].as_array().unwrap().len(), 1);
+    assert_eq!(scoped["panes"][0]["pane"], third.0.to_string());
+    let all = app.dispatch("pane.list", &json!({})).unwrap();
+    let explicitly_all = app
+        .dispatch("pane.list", &json!({"all_tabs": true}))
+        .unwrap();
+    assert_eq!(explicitly_all["panes"], all["panes"]);
+    let rows = all["panes"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let row = |id: PaneId| {
+        rows.iter()
+            .find(|row| {
+                row["pane"]
+                    .as_str()
+                    .and_then(|pane| pane.parse::<u32>().ok())
+                    == Some(id.0)
+            })
+            .expect("pane remains discoverable")
+    };
+    assert_eq!(row(first)["workspace"], "0");
+    assert_eq!(row(first)["workspace_id"], first_workspace_id);
+    assert_eq!(row(first)["tab"], "1");
+    assert_eq!(row(first)["tab_id"], first_tab_id);
+    assert_eq!(row(second)["workspace"], "0");
+    assert_eq!(row(second)["tab"], "2");
+    assert_eq!(row(second)["tab_id"], second_tab_id);
+    assert_eq!(row(third)["workspace"], "1");
+    assert_eq!(row(third)["tab"], "1");
+    assert_eq!(rows.iter().filter(|row| row["focused"] == true).count(), 1);
+    assert_eq!(row(third)["focused"], true);
+    assert_eq!(app.active_ws, active_workspace);
+    assert_eq!(app.layout().focus, active_focus);
+
+    for params in [
+        json!({"all_tabs": null}),
+        json!({"all_tabs": "true"}),
+        json!({"all_tabs": 1}),
+        json!({"unknown": true}),
+    ] {
+        let error = app.dispatch("pane.list", &params).unwrap_err();
+        assert_eq!(error.0, "invalid_request", "params: {params}");
+    }
+}
+
+#[test]
 fn pane_ids_are_checked_before_resolution_or_mutation() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new(80, 24, tx).unwrap();
