@@ -1679,6 +1679,116 @@ mod tests {
     }
 
     #[test]
+    fn terminal_exit_reports_status_once_for_either_event_order() {
+        for io_first in [true, false] {
+            let _env = crate::persist::test_env(if io_first {
+                "backend-exit-io-first"
+            } else {
+                "backend-exit-reaper-first"
+            });
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(80, 24, tx).unwrap();
+            let pane = app.layout().focus;
+            let floor = crate::ipc::api::current_sequence(&app.events);
+            let io = AppEvent::PtyIoClosed(pane);
+            let reaped = AppEvent::PtyReaped(
+                pane,
+                crate::event::PtyExitStatus::from(portable_pty::ExitStatus::with_exit_code(3)),
+            );
+            if io_first {
+                app.handle_event(io);
+                assert!(app.panes.contains_key(&pane));
+                app.handle_event(reaped);
+            } else {
+                app.handle_event(reaped);
+                assert!(app.panes.contains_key(&pane));
+                app.handle_event(io);
+            }
+            assert!(!app.panes.contains_key(&pane));
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited").len(),
+                1
+            );
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited")[0]["data"]["detail"],
+                json!({"exit_code":3,"signal":null})
+            );
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+                json!({"reason":"exited","exit_code":3,"signal":null})
+            );
+            app.handle_event(AppEvent::PtyIoClosed(pane));
+            assert_eq!(
+                backend_events_after(&app, floor, "terminal.exited").len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_exit_reports_signal_unknown_and_explicit_close() {
+        let _env = crate::persist::test_env("backend-exit-reasons");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        #[cfg(unix)]
+        // SAFETY: SIGKILL is a valid signal; strsignal returns a NUL-terminated
+        // description, copied before another call can reuse its buffer.
+        let killed = unsafe { std::ffi::CStr::from_ptr(libc::strsignal(libc::SIGKILL)) }
+            .to_str()
+            .unwrap();
+        #[cfg(windows)]
+        let killed = "Killed";
+        app.handle_event(AppEvent::PtyReaped(
+            pane,
+            portable_pty::ExitStatus::with_signal(killed).into(),
+        ));
+        app.handle_event(AppEvent::PtyIoClosed(pane));
+        let exited = backend_events_after(&app, floor, "terminal.exited");
+        let detail = &exited[0]["data"]["detail"];
+        assert!(detail["exit_code"].is_null());
+        #[cfg(unix)]
+        assert_eq!(detail["signal"], "SIGKILL");
+        #[cfg(windows)]
+        assert_eq!(detail["signal"], "Killed");
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.handle_event(AppEvent::PtyIoClosed(pane));
+        assert!(app.tick_pty_exits(Instant::now() + PTY_EXIT_GRACE));
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.exited")[0]["data"]["detail"],
+            json!({"exit_code":null,"signal":null})
+        );
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.close_pane(pane);
+        assert!(backend_events_after(&app, floor, "terminal.exited").is_empty());
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+            json!({"reason":"closed"})
+        );
+
+        let mut app = App::new(80, 24, std::sync::mpsc::channel().0).unwrap();
+        let pane = app.layout().focus;
+        let floor = crate::ipc::api::current_sequence(&app.events);
+        app.handle_event(AppEvent::PtyReaped(
+            pane,
+            portable_pty::ExitStatus::with_exit_code(7).into(),
+        ));
+        app.close_pane(pane);
+        assert!(backend_events_after(&app, floor, "terminal.exited").is_empty());
+        assert_eq!(
+            backend_events_after(&app, floor, "terminal.closed")[0]["data"]["detail"],
+            json!({"reason":"closed","exit_code":7,"signal":null})
+        );
+    }
+
+    #[test]
     fn rearm_publishes_only_a_new_trailing_terminal_revision() {
         let _env = crate::persist::test_env("backend-output-tail");
         let (tx, _rx) = std::sync::mpsc::channel();

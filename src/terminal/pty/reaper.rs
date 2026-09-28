@@ -54,8 +54,8 @@ pub(super) fn register_child_reaper(
         let _ = thread::Builder::new()
             .name("luvus-pty-reaper-fallback".to_string())
             .spawn(move || {
-                let _ = entry.child.wait();
-                finish_child(entry);
+                let status = entry.child.wait().ok();
+                finish_child(entry, status);
             });
         return;
     }
@@ -137,9 +137,9 @@ fn child_reaper_loop(rx: Receiver<ReaperEntry>, wake: Arc<ReaperWake>) {
 fn reap_finished(children: &mut Vec<ReaperEntry>) {
     let mut index = 0;
     while index < children.len() {
-        if child_poll_finished(children[index].child.try_wait()) {
+        if let Some(status) = child_poll_status(children[index].child.try_wait()) {
             let entry = children.swap_remove(index);
-            finish_child(entry);
+            finish_child(entry, Some(status));
         } else {
             index += 1;
         }
@@ -147,17 +147,20 @@ fn reap_finished(children: &mut Vec<ReaperEntry>) {
 }
 
 #[inline]
-pub(super) fn child_poll_finished(
+pub(super) fn child_poll_status(
     result: std::io::Result<Option<portable_pty::ExitStatus>>,
-) -> bool {
-    matches!(result, Ok(Some(_)))
+) -> Option<portable_pty::ExitStatus> {
+    result.ok().flatten()
 }
 
-fn finish_child(entry: ReaperEntry) {
+fn finish_child(entry: ReaperEntry, status: Option<portable_pty::ExitStatus>) {
     // Publish exit before notifying the app. If the app immediately drops the
     // pane, `Drop` must not signal a PID that the operating system may reuse.
     entry.child_exited.store(true, Ordering::SeqCst);
-    let _ = entry.app_tx.send(AppEvent::PtyExit(entry.id));
+    let _ = entry.app_tx.send(AppEvent::PtyReaped(
+        entry.id,
+        status.map(Into::into).unwrap_or_default(),
+    ));
 }
 
 struct ReaperWake {

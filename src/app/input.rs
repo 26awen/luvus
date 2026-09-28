@@ -883,18 +883,11 @@ impl App {
                 true // the pane's screen advanced
             }
             AppEvent::PtyExit(id) => {
-                self.runtime_cwd_dirty_panes.remove(&id);
-                crate::logging::event(
-                    crate::logging::EventKind::PtyExit,
-                    &[
-                        crate::logging::Field::PaneId(u64::from(id.0)),
-                        crate::logging::Field::ExitClass(crate::logging::ExitClass::Unknown),
-                    ],
-                );
-                self.emit_backend_terminal_event(id, "terminal.exited", json!({}));
-                self.close_pane(id);
-                true
+                // Spawn failures have no child status or readable PTY.
+                self.note_pty_exit(id, true, Some(Default::default()))
             }
+            AppEvent::PtyIoClosed(id) => self.note_pty_exit(id, true, None),
+            AppEvent::PtyReaped(id, status) => self.note_pty_exit(id, false, Some(status)),
             // Control-API requests arrive on the event channel so the loop wakes
             // for them immediately (docs/81). Answer inline: like the old
             // server-side drain, an answered request counts as activity.
