@@ -19032,6 +19032,25 @@ fi
             for row in 10..=13 {
                 engine.advance(format!("\x1b[{row};5H┃").as_bytes());
             }
+            engine.advance(b"\x1b[11;8H");
+        }
+        assert!(!app.agent_prompt_is_ready(id, false));
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "partial-composer".into(),
+            json!({"target":target,"text":"still too early"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["error"]["code"], "agent_not_ready");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "partial box must queue no input"
+        );
+
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
             engine.advance(format!("\x1b[14;5H╹{}\x1b[11;8H", "▀".repeat(35)).as_bytes());
         }
         assert!(app.agent_prompt_is_ready(id, false));

@@ -646,14 +646,10 @@ impl VtEngine for AlacrittyEngine {
             let underline = (rail + 1..cols)
                 .take_while(|&col| symbol(edge, col) == '▀')
                 .count();
-            let opaque_edge = symbol(edge, rail) == '╹' && underline >= 16;
-            // A transparent prompt background replaces both the corner and
-            // underline with spaces. Its live rail and cursor still identify
-            // the input box, but the next row must be blank at that edge.
-            let transparent_edge = cols - rail > 16
-                && matches!(symbol(edge, rail), ' ' | '\0')
-                && (rail + 1..rail + 17).all(|col| matches!(symbol(edge, col), ' ' | '\0'));
-            if opaque_edge || transparent_edge {
+            // A blank row can be an unfinished redraw, even when a transparent
+            // theme would also render a blank edge. Fail closed without a
+            // measured lower border, and keep the cursor inside that border.
+            if symbol(edge, rail) == '╹' && underline >= 16 && col <= rail + underline {
                 return true;
             }
         }
@@ -2973,17 +2969,20 @@ mod tests {
         }
         e.advance(format!("\x1b[22;23H╹{}\x1b[19;26H", "▀".repeat(80)).as_bytes());
         assert!(e.opencode_composer_ready());
+
+        e.advance(b"\x1b[19;111H");
+        assert!(!e.opencode_composer_ready(), "cursor beyond the lower edge");
     }
 
     #[test]
-    fn opencode_composer_accepts_a_transparent_theme() {
+    fn opencode_composer_rejects_an_unproven_blank_edge() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(80, 24, tx, budget_for_rows(80, 2_000));
         for row in 12..=15 {
             e.advance(format!("\x1b[{row};12H┃").as_bytes());
         }
         e.advance(b"\x1b[13;15H");
-        assert!(e.opencode_composer_ready());
+        assert!(!e.opencode_composer_ready(), "undrawn edge is not proof");
 
         e.advance(b"\x1b[16;13Hpartial edge\x1b[13;15H");
         assert!(!e.opencode_composer_ready());

@@ -565,6 +565,8 @@ agent; an agent without a detector returns `agent_not_ready`. The default for
 other agents remains permissive on Unknown evidence. Rejection queues neither
 text nor Enter. Read the visible agent output and use `agent.keys` only when an
 explicit interaction is intended.
+An OpenCode theme that hides the composer's lower edge cannot establish this
+evidence and remains `agent_not_ready`.
 
 For explicit key interactions, `agent.read` adds `content_revision` (the pane's
 PTY output counter) and `terminal_id` (32 lowercase hexadecimal characters for
