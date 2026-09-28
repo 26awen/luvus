@@ -18995,6 +18995,81 @@ fi
         }
     }
 
+    #[test]
+    fn opencode_prompt_methods_wait_for_live_composer() {
+        let _env = crate::persist::test_env("opencode-prompt-readiness");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(40, 20, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "opencode".into();
+        let (input_tx, input_rx) = mpsc::channel();
+        app.panes
+            .get_mut(&id)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+        let target = id.0.to_string();
+
+        assert!(!app.agent_prompt_is_ready(id, false));
+        let sent = api_call(
+            &mut app,
+            "agent.send",
+            json!({"target":target,"text":"too early"}),
+        );
+        assert_eq!(sent["error"]["code"], "agent_not_ready");
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "before-composer".into(),
+            json!({"target":target,"text":"too early"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["error"]["code"], "agent_not_ready");
+        assert!(input_rx.try_recv().is_err(), "startup must queue no input");
+
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            for row in 10..=13 {
+                engine.advance(format!("\x1b[{row};5H┃").as_bytes());
+            }
+            engine.advance(b"\x1b[11;8H");
+        }
+        assert!(!app.agent_prompt_is_ready(id, false));
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "partial-composer".into(),
+            json!({"target":target,"text":"still too early"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["error"]["code"], "agent_not_ready");
+        assert!(
+            input_rx.try_recv().is_err(),
+            "partial box must queue no input"
+        );
+
+        {
+            let mut engine = app.panes.get(&id).unwrap().engine.lock().unwrap();
+            engine.advance(format!("\x1b[14;5H╹{}\x1b[11;8H", "▀".repeat(35)).as_bytes());
+        }
+        assert!(app.agent_prompt_is_ready(id, false));
+        assert!(app.agent_prompt_is_ready(id, true));
+        let (reply, response) = mpsc::channel();
+        app.start_agent_prompt(
+            "after-composer".into(),
+            json!({"target":target,"text":"hello"}),
+            reply,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let prompted: serde_json::Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+        assert_eq!(prompted["result"]["submitted"], true);
+        assert!(matches!(
+            input_rx.try_recv().unwrap(),
+            crate::terminal::pty::InputAction::Submit { .. }
+        ));
+    }
+
     // A bursty/streaming agent has long pauses *within* one turn. The debounce
     // (QUIET_DWELL) must hold the status at Working through those pauses and
     // only commit Done — and chime — on sustained quiet, once per real finish.
