@@ -349,6 +349,12 @@ impl App {
                     .map(str::to_string)
             });
         if pending.as_deref() == Some(WORKTREE_REMOVE_PENDING) {
+            let ownership = req
+                .params
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(std::path::Path::new)
+                .map(|path| self.capture_worktree_remove_ownership(path));
             let mut retry = req.clone();
             if let Some(params) = retry.params.as_object_mut() {
                 // Removal is irreversible once the provider starts. The
@@ -360,7 +366,18 @@ impl App {
             let parked = req.clone();
             let scheduled = self.schedule_pending_worktree_remove(move |app, result| {
                 let response = match result {
-                    Ok(()) => app.handle_api(&retry),
+                    Ok(()) => {
+                        let response = app.handle_api(&retry);
+                        let succeeded = serde_json::from_str::<serde_json::Value>(&response)
+                            .ok()
+                            .is_some_and(|value| value.get("error").is_none());
+                        if succeeded {
+                            if let Some(ownership) = ownership {
+                                app.finish_explicit_worktree_remove(ownership);
+                            }
+                        }
+                        response
+                    }
                     Err(message) => json!({"id":parked.id,"error":{
                         "code":"git_error", "message":message
                     }})
