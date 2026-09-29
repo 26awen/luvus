@@ -763,14 +763,24 @@ impl App {
             if let Some((running, label)) = commander.running_module.as_ref() {
                 if *running == log_id {
                     let outcome = if succeeded { "succeeded" } else { "failed" };
-                    commander.receipt = Some(format!(
+                    let completion = format!(
                         "{label} {outcome} · log {log_id}{}",
                         if detail.is_empty() {
                             String::new()
                         } else {
                             format!(" · {detail}")
                         }
-                    ));
+                    );
+                    // An armed confirmation owns the receipt line: its prompt is
+                    // the only thing telling the user that Enter will act. Keep
+                    // that prompt first and append this result, so neither is
+                    // lost and Enter never fires behind a hidden prompt.
+                    let confirming = commander.pending_module_confirmation.is_some()
+                        || commander.pending_working_confirmation.is_some();
+                    commander.receipt = match commander.receipt.take() {
+                        Some(prompt) if confirming => Some(format!("{prompt} · {completion}")),
+                        _ => Some(completion),
+                    };
                     commander.running_module = None;
                 }
             }

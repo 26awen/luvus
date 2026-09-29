@@ -2634,3 +2634,69 @@ fn clicking_another_tab_works_while_the_strip_stays_open() {
     assert!(!app.commander.as_ref().unwrap().focused);
     assert_eq!(app.commander.as_ref().unwrap().draft, draft);
 }
+
+/// A completion arriving while the user is confirming a different module command
+/// must not hide that confirmation's prompt. The prompt stays first on the
+/// receipt line, the confirmation stays armed, and the result is still shown.
+#[cfg(unix)]
+#[test]
+fn module_completion_keeps_a_pending_confirmation_prompt_visible() {
+    let _env = crate::persist::test_env("commander-module-confirm-receipt");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(80, 24, tx).unwrap();
+    let pane = app.layout().focus;
+    add_commander_test_module(
+        &mut app,
+        "example",
+        "review",
+        "pane",
+        "text",
+        "required",
+        &["sh", "-c", "cat"],
+    );
+    app.open_commander();
+
+    // Start action A: the first Enter asks, the second one runs it.
+    app.commander.as_mut().unwrap().clear_all();
+    app.commander
+        .as_mut()
+        .unwrap()
+        .insert(&format!("$review @p{} first", pane.0));
+    app.commander_prepare();
+    app.commander_prepare();
+    assert_eq!(app.module_logs.len(), 1, "action A started");
+    let first = app.module_logs[0].id;
+
+    // While A is still running, begin a second command and reach its prompt.
+    app.commander.as_mut().unwrap().clear_all();
+    app.commander
+        .as_mut()
+        .unwrap()
+        .insert(&format!("$review @p{} second", pane.0));
+    app.commander_prepare();
+    let commander = app.commander.as_ref().unwrap();
+    assert!(
+        commander.pending_module_confirmation.is_some(),
+        "B awaits Enter"
+    );
+    let prompt = commander.receipt.clone().expect("B shows its prompt");
+
+    // A finishes now.
+    app.module_command_finished(first, Some(0), String::new(), String::new());
+
+    let commander = app.commander.as_ref().unwrap();
+    let receipt = commander.receipt.as_deref().unwrap();
+    assert!(
+        commander.pending_module_confirmation.is_some(),
+        "B is still armed"
+    );
+    assert!(
+        receipt.starts_with(&prompt),
+        "an armed confirmation lost its prompt: {receipt:?}"
+    );
+    assert!(
+        receipt.contains("succeeded"),
+        "A's result is shown: {receipt:?}"
+    );
+    assert_eq!(app.module_logs.len(), 1, "B has not run");
+}
