@@ -60,6 +60,8 @@ installed example.agent-ping (RizRiyz/luvus-agent-ping@5d3687f1528e…)
 
 Read that command list before you say yes. It is the whole security review, and
 it is short on purpose.
+An action opted into Commander also shows its `$` name, target, input, and
+confirmation policy in this preview.
 
 Use `--yes` to skip the prompt in scripts and CI, and only for sources you
 already trust. There's no `module update`: reinstall from GitHub to refresh a
@@ -108,6 +110,10 @@ luvus module log [<id>]          # captured stdout/stderr + exit status
 luvus module uninstall <id>      # unregister + delete a managed checkout
 luvus module unlink <id>         # unregister only, leave the files alone
 ```
+
+For an action that declares a Commander command, open Commander, clear its
+initial `@pID` with `Ctrl+U`, and type `$` to browse. See the
+[Commander guide](/docs/guides/commander/) for target syntax and confirmation.
 
 :::tip[Name it however you remember it]
 Anywhere a command takes `<id>`, you can pass either the module's id or the

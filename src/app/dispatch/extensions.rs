@@ -641,7 +641,13 @@ impl App {
                 "warning": m.warning,
                 "platforms": m.manifest.platforms,
                 "actions": m.manifest.actions.iter()
-                    .map(|a| json!({"id": a.id, "title": a.title, "contexts": a.contexts})).collect::<Vec<_>>(),
+                    .map(|a| {
+                        let mut item = json!({"id": a.id, "title": a.title, "contexts": a.contexts});
+                        if let Some(commander) = &a.commander {
+                            item["commander"] = json!(commander);
+                        }
+                        item
+                    }).collect::<Vec<_>>(),
                 "panes": m.manifest.panes.iter()
                     .map(|pe| json!({"id": pe.id, "title": pe.title, "placement": pe.placement})).collect::<Vec<_>>(),
                 "bars": m.manifest.bars.iter()
@@ -709,12 +715,16 @@ impl App {
             let mut arr = Vec::new();
             for m in &self.modules.modules {
                 for a in &m.manifest.actions {
-                    arr.push(json!({
+                    let mut item = json!({
                         "module": m.id, "action": a.id,
                         "qualified": format!("{}.{}", m.id, a.id),
                         "title": a.title, "contexts": a.contexts,
                         "runnable": m.is_runnable(),
-                    }));
+                    });
+                    if let Some(commander) = &a.commander {
+                        item["commander"] = json!(commander);
+                    }
+                    arr.push(item);
                 }
             }
             Ok(json!({"type":"module_action_list","actions":arr}))

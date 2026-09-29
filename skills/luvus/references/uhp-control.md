@@ -97,6 +97,9 @@ read current state and reconcile instead of blindly retrying.
 - Mission Control: read with `mission.snapshot`, refresh usage on demand with
   `mission.refresh`, and change the visible UI only with `mission.open`
 - Worktrees and orchestration: `worktree.*`, `task.*`, and `lease.*`
+  - `worktree.remove` refuses active agent, task, or lease ownership with
+    `worktree_in_use`. Send `force: true` only with explicit approval to stop
+    the listed work and remove its checkout.
 - Agent scheduling: inspect with `automation.list`, `automation.get`,
   `automation.history`, `automation.preview`, and `automation.health`; mutate
   with `automation.create`, `automation.update`, `automation.enable`,
@@ -194,14 +197,19 @@ Without `wait:true`, the immediate `submitted:true`, `evidence:"queued"` respons
 unchanged and omits `observed_state`. Submission still means queue admission;
 state transitions do not confirm consumption of the prompt text. Do not resend
 automatically after a timeout or lost response because queued input may execute.
-For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
-in non-Codex panes—returns `agent_not_ready` before text or Enter is queued.
-Startup, sign-in, selection, and approval screens are examples, not an
-exhaustive list. A server-launched or restored Codex pane with an `agent_session`
-also returns `agent_not_ready` when prompt evidence is Unknown, unless live Codex
-composer geometry reports Ready. Existing Codex panes without that requirement
-retain the permissive Unknown-evidence fallback. Inspect the visible screen and
-use `agent.keys` only for an explicitly authorized interaction.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence returns
+`agent_not_ready` before text or Enter is queued. Claude and Codex require
+positive live composer evidence even without `strict:true`. Pass `strict:true`
+to require that evidence for any agent; agents without a detector reject the
+prompt. Other agents retain the permissive Unknown-evidence fallback when
+strict is omitted. Inspect the visible screen and use `agent.keys` only for an
+explicitly authorized interaction.
+
+For UHP prompt calls that must reach the same PTY after a possible restart,
+pass the `terminal_id` from `agent.read` or `agent.list` to `agent.prompt` or
+`agent.send`. A mismatch returns `content_revision_conflict` before input is
+queued. Check `uhp.capabilities.concurrency.agent_prompt_terminal_id` first:
+older servers can silently ignore this field on `agent.send`.
 
 For UHP interactions that must match the inspected screen, use `agent.read`
 with `source:"visible"` and pass its `content_revision` as `if_content_revision`

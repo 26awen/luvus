@@ -1,5 +1,6 @@
 import { BridgeClient, BridgeError, LiveSession, type PaneSnapshot, type SessionSnapshot } from "@luvus/uhp-client";
 import { button, element } from "./dom.js";
+import { dashboardAgents, displayText } from "./dashboard-agents.js";
 import { pairingQrDataUrl } from "./pairing-qr.js";
 import { supportsFileUpload } from "./terminal-capabilities.js";
 import { TerminalView, type TerminalPaneOption } from "./terminal-view.js";
@@ -40,6 +41,7 @@ export class WebApp {
   #sessions: BrowserSession[] | undefined;
   #sessionPanelOpen = false;
   #sessionLoading = false;
+  #showShells = false;
 
   constructor(private readonly root: HTMLElement) {
     const pair = consumePairingFragment();
@@ -386,11 +388,7 @@ export class WebApp {
   }
 
   #dashboard(snapshot: SessionSnapshot): HTMLElement {
-    const agents = snapshot.workspaces.flatMap((workspace, workspaceIndex) => workspace.tabs.flatMap((tab) => tab.panes.map((pane) => ({
-      pane,
-      workspace: displayText(workspace.name, `Workspace ${workspaceIndex + 1}`),
-    })))).filter(({ pane }) => displayText(pane.agent, "") !== "");
-    const workingAgents = agents.filter(({ pane }) => pane.agent_status === "working").length;
+    const { agentCount, workingCount, cards } = dashboardAgents(snapshot, this.#showShells);
     const tabCount = snapshot.workspaces.reduce((total, workspace) => total + workspace.tabs.length, 0);
     const paneCount = snapshot.workspaces.reduce((total, workspace) => total
       + workspace.tabs.reduce((tabTotal, tab) => tabTotal + tab.panes.length, 0), 0);
@@ -446,7 +444,7 @@ export class WebApp {
               element("div", { className: "orbit orbit-outer" }),
               element("div", { className: "orbit orbit-inner" }),
               element("div", { className: "core-mark" }, element("img", { attrs: { src: "/mark.svg", alt: "" } })),
-              element("div", { className: "core-label" }, element("strong", { text: "SYSTEM ONLINE" }), element("small", { text: `${workingAgents} executing` })),
+              element("div", { className: "core-label" }, element("strong", { text: "SYSTEM ONLINE" }), element("small", { text: `${workingCount} executing` })),
             ),
             element("div", { className: "hero-session-wrap" },
               element("button", {
@@ -466,29 +464,41 @@ export class WebApp {
           ),
           element("div", { className: "hero-stat-column stats-right" },
             missionStat(String(paneCount).padStart(2, "0"), "Live panes"),
-            missionStat(String(agents.length).padStart(2, "0"), "Agents"),
+            missionStat(String(agentCount).padStart(2, "0"), "Agents"),
           ),
         ),
         button("Refresh telemetry", "ghost hero-refresh", () => void this.#session.refresh().catch((error) => this.#showError(error))),
       ),
-      agents.length ? element("section", { className: "section" },
+      element("section", { className: "section" },
         element("div", { className: "section-heading", attrs: { id: "mission-agents" } },
           element("h2", { className: "section-title", text: "Agents" }),
-          element("span", { className: "section-status", text: workingAgents ? `${workingAgents} executing` : "All standing by" }),
+          element("div", { className: "agent-filters", attrs: { role: "group", "aria-label": "Filter agents" } },
+            ...[false, true].map((showShells) => element("button", {
+              className: "agent-filter",
+              text: showShells ? "All panes" : "Active agents",
+              attrs: { type: "button", "aria-pressed": String(this.#showShells === showShells), title: showShells ? "Include shell panes" : "Show detected agents, including idle and waiting agents" },
+              on: { click: () => {
+                this.#showShells = showShells;
+                this.#render();
+                this.root.querySelector<HTMLButtonElement>('.agent-filter[aria-pressed="true"]')?.focus();
+              } },
+            })),
+          ),
         ),
-        element("div", { className: "agent-grid" }, ...agents.map(({ pane, workspace }) => element("button", {
+        element("div", { className: "agent-grid" }, ...cards.map(({ pane, context, title, state, titleAbsent, available }) => element("button", {
           className: "agent-card",
-          attrs: { type: "button" },
-          on: { click: () => this.#openTerminal(snapshot, pane) },
+          attrs: { type: "button", ...(available ? {} : { disabled: "", title: "Terminal unavailable" }) },
+          on: { click: () => { if (available) this.#openTerminal(snapshot, pane); } },
         },
         element("div", { className: "agent-copy" },
-          element("small", { className: "agent-context", text: `${displayText(pane.agent_name, displayText(pane.agent, "Agent"))} · ${workspace}` }),
-          element("strong", { className: `agent-session-title${displayText(pane.agent_session_title, "") ? "" : " absent"}`, text: displayText(pane.agent_session_title, "Untitled session") }),
+          element("small", { className: "agent-context", text: context }),
+          element("strong", { className: `agent-session-title${titleAbsent ? " absent" : ""}`, text: title }),
         ),
-        element("span", { className: "agent-state", text: displayText(pane.agent_status, "unknown") }),
-        missionIcon("arrow"),
+        element("span", { className: "agent-state", text: available ? state : "Terminal unavailable" }),
+        available ? missionIcon("arrow") : undefined,
         ))),
-      ) : undefined,
+        cards.length === 0 ? element("p", { className: "workspace-empty", text: this.#showShells ? "No terminal panes in this session." : "No active agents. Choose All panes to show shells." }) : undefined,
+      ),
       element("section", { className: "section" },
         element("div", { className: "section-heading", attrs: { id: "mission-workspaces" } },
           element("h2", { className: "section-title", text: "Workspaces" }),
@@ -632,12 +642,6 @@ function asBrowserSessions(value: unknown): BrowserSession[] {
     ) throw new BridgeError("Invalid browser session entry", "invalid_response");
     return session as BrowserSession;
   });
-}
-
-function displayText(value: unknown, fallback: string): string {
-  if (typeof value !== "string") return fallback;
-  const text = value.trim();
-  return text && text.toLowerCase() !== "null" ? text : fallback;
 }
 
 function paneStateClass(state: string): string {

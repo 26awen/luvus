@@ -135,6 +135,10 @@ Branch-backed dependencies unblock only after they are merged into the shared
 integration history.
 `task release` requeues active work and releases its path leases, but it does
 not stop the worker pane or discard its worktree.
+`worktree remove <path>` refuses to delete a worktree that still owns a working
+or blocked agent pane, unfinished task, or lease. Report the returned
+`worktree_in_use` blockers. Use `--force` only with explicit approval to stop
+that listed work and remove its checkout.
 `task retry <id>` queues a fresh attempt for terminal `done`, `failed`,
 `review`, or `blocked` work while preserving the old pane, branch, worktree,
 output, and notes. Inspect dependents first because retry is rejected after a
@@ -265,6 +269,9 @@ Target a named session without attaching its TUI:
 luvus --session <name> pane list
 ```
 
+`pane list` discovers pane IDs across all workspaces and tabs in that session
+without changing focus. Add `--current-tab` to limit the result to the active tab.
+
 Each named session owns an independent workspace tree and saved-machine
 catalog. A session switch must not copy workspaces or machine profiles from the
 previous session. An explicit selector for another server also discards the
@@ -300,13 +307,19 @@ remains the stored home root while `terminal_cwd` follows the focused pane. Use
 `agent prompt` submits one complete prompt and can wait semantically. Prefer it
 to separate text and Enter operations. A timeout does not prove that an agent
 failed or stopped. Inspect it before deciding what to do next.
-For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
-in non-Codex panes—rejects submission with `agent_not_ready` before either text
-or Enter is queued. Startup, sign-in, selection, and approval screens are
-examples, not an exhaustive list. A server-launched or restored Codex pane with
-an `agent_session` also returns `agent_not_ready` when prompt evidence is
-Unknown, unless live Codex composer geometry reports Ready. Existing Codex panes
-without that requirement retain the permissive Unknown-evidence fallback.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence rejects
+submission with `agent_not_ready` before either text or Enter is queued.
+Claude and Codex also require positive evidence of their live input composers;
+an unrecognised startup or selection screen is not prompt-ready even when its
+agent identity is known. `--strict` (UHP `strict:true`) requires positive
+composer evidence for any agent; agents without a detector reject the prompt.
+Without strict mode, other agents retain the legacy Unknown-evidence fallback.
+
+UHP `agent.prompt` and `agent.send` accept an optional `terminal_id` from
+`agent.read` or `agent.list`. A mismatch rejects the request before input is
+queued, which protects against pane ID reuse after server restart. Verify
+`uhp.capabilities.concurrency.agent_prompt_terminal_id` first when relying on
+this fence; older servers may silently ignore it on `agent.send`.
 
 `agent keys` refuses plain shells, validates every named key before sending any
 bytes, and queues a valid list as one ordered action. A closed target returns a
@@ -367,6 +380,10 @@ discovery rather than inferring support from an agent name.
   reports only the exact Letta conversation ID selected in that pane. Detection
   remains native, and Luvus does not inspect Letta memory, credentials,
   conversations, or cloud state.
+- `luvus integration install devin` adds one `SessionStart` hook that reports
+  only the exact Devin session ID selected in that pane, including after
+  `/clear` or an in-TUI `/resume`. Detection remains native, and Luvus does not
+  open Devin's private session database.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.

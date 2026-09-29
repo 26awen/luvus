@@ -143,7 +143,8 @@ tabs:
   tab close [<n>]            close a tab (default: active)
 
 panes / agents:
-  pane list                  list panes and read-only history metrics in the current tab
+  pane list [--all-tabs]     list panes across every workspace and tab
+  pane list --current-tab    list panes and read-only history metrics in the current tab
   pane split [<id>] [--auto|--right|--down] [--no-focus]   split a pane (default: auto by size, creates a workspace if empty)
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
@@ -160,9 +161,9 @@ panes / agents:
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
   agent name <name>          alias the current agent, same as pane name (--clear to drop)
-  agent prompt <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              atomically prompt and optionally wait (send is an alias)
-  agent send <target> <text> [--wait] [--until STATE] [--timeout <s>]
+  agent send <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout <s>]
                              compatibility alias for agent prompt
   agent keys <target> <key>...   send control keys (enter, esc, ctrl+c, up, …)
   agent read <target> [--lines N] [--source visible|recent]   print an agent's output
@@ -273,7 +274,7 @@ worktrees:
   worktree list              list the current repo's worktrees
   worktree create <branch>   create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
-  worktree remove <path>     remove a worktree (its branch is kept)
+  worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
   task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]
@@ -369,7 +370,7 @@ server:
   server restart [--all]     stop + start (load a newly-installed binary)
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|antigravity|letta|opencode|kimi|grok|hermes|omp>
+  integration install|uninstall <claude|copilot|codex|antigravity|letta|opencode|kimi|grok|hermes|omp|devin>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 ";
@@ -2193,15 +2194,17 @@ fn skill_cmd(rest: &[String], context: crate::i18n::cli::Context) -> Result<i32>
     }
 }
 
-/// `luvus agent prompt <target> <text…> [--wait] [--until STATE] [--timeout S]`
+/// `luvus agent prompt <target> <text…> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]`
 /// submits and waits as one server-owned operation. `agent send` remains a
 /// compatibility alias.
 fn agent_send_cmd(args: &[String]) -> Result<i32> {
     let target = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent prompt <target> <text> [--wait] [--until STATE] [--timeout S]")
+        anyhow!("usage: luvus agent prompt <target> <text> [--terminal-id ID] [--strict] [--wait] [--until STATE] [--timeout S]")
     })?;
     let mut text_parts = Vec::new();
     let mut wait = false;
+    let mut strict = false;
+    let mut terminal_id = None;
     let mut until = Vec::new();
     let mut timeout = None;
     let mut positional_only = false;
@@ -2221,6 +2224,22 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
             "--wait" => {
                 wait = true;
                 index += 1;
+            }
+            "--strict" => {
+                strict = true;
+                index += 1;
+            }
+            "--terminal-id" => {
+                let id = args.get(index + 1).ok_or_else(|| {
+                    anyhow!("--terminal-id requires a 32-character lowercase hex ID")
+                })?;
+                if !crate::terminal::backend::valid_id(id) {
+                    return Err(anyhow!(
+                        "--terminal-id requires a 32-character lowercase hex ID"
+                    ));
+                }
+                terminal_id = Some(id.clone());
+                index += 2;
             }
             "--until" => {
                 until.push(
@@ -2256,6 +2275,12 @@ fn agent_send_cmd(args: &[String]) -> Result<i32> {
     params.insert("target".into(), json!(target));
     params.insert("text".into(), json!(text));
     params.insert("wait".into(), json!(wait));
+    if strict {
+        params.insert("strict".into(), json!(true));
+    }
+    if let Some(terminal_id) = terminal_id {
+        params.insert("terminal_id".into(), json!(terminal_id));
+    }
     if !until.is_empty() {
         params.insert("until".into(), json!(until));
     }
@@ -2661,6 +2686,13 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 } else {
                     "usage: luvus search <text...> [--case]"
                 }));
+            }
+            let query_bytes = query
+                .iter()
+                .map(String::len)
+                .fold(query.len().saturating_sub(1), usize::saturating_add);
+            if !fuzzy && query_bytes > crate::search::local::LOCAL_QUERY_BYTES {
+                return Err(anyhow!("exact search query must be at most 4096 bytes"));
             }
             if fuzzy {
                 (
@@ -3408,9 +3440,17 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(t) = flag(args, "--tool") {
                 obj.insert("tool".to_string(), json!(t));
             }
+            if let Some(notification_type) = flag(args, "--notification-type") {
+                obj.insert("notification_type".to_string(), json!(notification_type));
+            }
             ("pane.report_event".into(), with_pane(obj))
         }
-        ("pane", "" | "list") => ("pane.list".into(), json!({})),
+        ("pane", "" | "list") => match rest {
+            [] => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--all-tabs" => ("pane.list".into(), json!({"all_tabs": true})),
+            [flag] if flag == "--current-tab" => ("pane.list".into(), json!({"all_tabs": false})),
+            _ => return Err(anyhow!("usage: luvus pane list [--all-tabs|--current-tab]")),
+        },
         ("pane", other) => {
             return Err(anyhow!(
                 "unknown pane command `{other}`. Try `luvus help pane`."
@@ -3509,7 +3549,12 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 _ => return Err(anyhow!("usage: luvus module pane open|focus|close …")),
             }
         }
-        ("module", _) => ("module.list".into(), json!({})),
+        ("module", "" | "list") => ("module.list".into(), json!({})),
+        ("module", other) => {
+            return Err(anyhow!(
+                "unknown module command `{other}`. Try `luvus help module`."
+            ))
+        }
 
         ("diff", "refresh") => {
             if !rest.is_empty() {
@@ -3743,7 +3788,31 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("worktree", "create") => ("worktree.create".into(), one("branch", arg0())),
         ("worktree", "open") => ("worktree.open".into(), one("path", arg0())),
-        ("worktree", "remove") => ("worktree.remove".into(), one("path", arg0())),
+        ("worktree", "remove") => {
+            let usage = "usage: luvus worktree remove <path> [--force]";
+            let mut path = None;
+            let mut force = false;
+            for value in rest {
+                match value.as_str() {
+                    "--force" if !force => force = true,
+                    "--force" => return Err(anyhow!("--force may be passed only once")),
+                    option if option.starts_with("--") => {
+                        return Err(anyhow!(
+                            "unknown worktree remove option `{option}`. {usage}"
+                        ));
+                    }
+                    value if path.is_none() => path = Some(value.to_string()),
+                    _ => return Err(anyhow!(usage)),
+                }
+            }
+            let path = path.ok_or_else(|| anyhow!(usage))?;
+            let mut params = serde_json::Map::new();
+            params.insert("path".to_string(), json!(path));
+            if force {
+                params.insert("force".to_string(), json!(true));
+            }
+            ("worktree.remove".into(), Value::Object(params))
+        }
         ("worktree", _) => ("worktree.list".into(), json!({})),
 
         ("automation", "create") => {
@@ -4602,6 +4671,19 @@ mod tests {
     }
 
     #[test]
+    fn pane_report_event_forwards_notification_type() {
+        let (method, params) = parse(&argv(
+            "luvus pane report-event 9 --agent claude --kind Notification --notification-type idle_prompt",
+        ))
+        .unwrap();
+        assert_eq!(method, "pane.report_event");
+        assert_eq!(params["pane"], "9");
+        assert_eq!(params["agent"], "claude");
+        assert_eq!(params["kind"], "Notification");
+        assert_eq!(params["notification_type"], "idle_prompt");
+    }
+
+    #[test]
     fn pane_send_requests_atomic_paste_semantics() {
         let (method, params) = parse(&argv("luvus pane send 9 first second")).unwrap();
         assert_eq!(method, "pane.send_input");
@@ -4793,8 +4875,18 @@ mod tests {
         let (m, _) = parse(&argv("luvus ping")).unwrap();
         assert_eq!(m, "ping");
 
-        let (m, _) = parse(&argv("luvus pane list")).unwrap();
+        let (m, p) = parse(&argv("luvus pane list")).unwrap();
         assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --all-tabs")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": true}));
+        let (m, p) = parse(&argv("luvus pane list --current-tab")).unwrap();
+        assert_eq!(m, "pane.list");
+        assert_eq!(p, json!({"all_tabs": false}));
+        assert!(parse(&argv("luvus pane list --all-tabs --all-tabs")).is_err());
+        assert!(parse(&argv("luvus pane list --all-tabs --current-tab")).is_err());
+        assert!(parse(&argv("luvus pane list --unknown")).is_err());
 
         let (m, p) = parse(&argv("luvus pane split --down")).unwrap();
         assert_eq!(m, "pane.split");
@@ -4885,6 +4977,21 @@ mod tests {
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }
+
+        let oversized = format!(
+            "luvus search {}",
+            "x".repeat(crate::search::local::LOCAL_QUERY_BYTES + 1)
+        );
+        let error = parse(&argv(&oversized)).expect_err("oversized exact search must fail");
+        assert_eq!(
+            error.to_string(),
+            "exact search query must be at most 4096 bytes"
+        );
+        let localized = localize_cli_error_with(
+            error,
+            crate::i18n::cli::Context::for_language(crate::i18n::cli::Language::Zh),
+        );
+        assert_eq!(localized.to_string(), "精确搜索查询不得超过 4096 字节");
     }
 
     #[test]
@@ -5556,6 +5663,16 @@ mod tests {
         let (m, p) = parse(&argv("luvus module enable my-mod")).unwrap();
         assert_eq!(m, "module.enable");
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("my-mod"));
+
+        let (m, _) = parse(&argv("luvus module")).unwrap();
+        assert_eq!(m, "module.list");
+
+        assert_eq!(
+            parse(&argv("luvus module action my-mod refresh"))
+                .unwrap_err()
+                .to_string(),
+            "unknown module command `action`. Try `luvus help module`."
+        );
     }
 
     fn wait_test_server() -> crate::ipc::transport::Listener {
@@ -5590,6 +5707,10 @@ mod tests {
             ("luvus agent prompt 7 review", json!({"target":"7","text":"review","wait":false})),
             ("luvus agent send reviewer review this", json!({"target":"reviewer","text":"review this","wait":false})),
             ("luvus agent prompt codex review --wait", json!({"target":"codex","text":"review","wait":true})),
+            ("luvus agent prompt claude --strict review", json!({"target":"claude","text":"review","wait":false,"strict":true})),
+            ("luvus agent send reviewer --strict review this", json!({"target":"reviewer","text":"review this","wait":false,"strict":true})),
+            ("luvus agent prompt 7 review --terminal-id 0123456789abcdef0123456789abcdef", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
+            ("luvus agent send 7 --terminal-id 0123456789abcdef0123456789abcdef review", json!({"target":"7","text":"review","wait":false,"terminal_id":"0123456789abcdef0123456789abcdef"})),
             ("luvus agent send 7 review --wait --until done --timeout 0.5", json!({"target":"7","text":"review","wait":true,"until":["done"],"timeout_s":0.5})),
             ("luvus agent prompt 7 --wait --until idle --until working --until blocked --until done review --timeout 3600", json!({"target":"7","text":"review","wait":true,"until":["idle","working","blocked","done"],"timeout_s":3600.0})),
             ("luvus agent send 7 --wait --until idle --until idle --timeout 0 review", json!({"target":"7","text":"review","wait":true,"until":["idle","idle"],"timeout_s":0.0})),
@@ -5634,6 +5755,12 @@ mod tests {
             assert_eq!(agent_send_cmd(&argv(invocation)).unwrap(), exit);
         }
         server.join().unwrap();
+        for invocation in [
+            "luvus agent prompt 7 review --terminal-id BAD",
+            "luvus agent send 7 review --terminal-id",
+        ] {
+            assert!(agent_send_cmd(&argv(invocation)).is_err(), "{invocation}");
+        }
     }
 
     #[test]
@@ -6071,6 +6198,14 @@ mod tests {
         let (m, p) = parse(&argv("luvus worktree remove /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.remove");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force"), None);
+        let (m, p) = parse(&argv("luvus worktree remove --force /tmp/wt")).unwrap();
+        assert_eq!(m, "worktree.remove");
+        assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
+        assert_eq!(p.get("force").and_then(Value::as_bool), Some(true));
+        assert!(parse(&argv("luvus worktree remove")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/a /tmp/b")).is_err());
+        assert!(parse(&argv("luvus worktree remove /tmp/wt --unknown")).is_err());
     }
 
     #[test]
@@ -6212,13 +6347,16 @@ mod tests {
         // different agent with no hook integration, so neither the help text
         // nor the published CLI reference may advertise `pi` here — and both
         // must list `omp`.
-        assert!(DETAILED_USAGE.contains("|omp>"));
-        assert!(!DETAILED_USAGE.contains("|pi>"));
+        let lists = |text: &str, agent: &str| {
+            text.contains(&format!("|{agent}|")) || text.contains(&format!("|{agent}>"))
+        };
+        assert!(lists(DETAILED_USAGE, "omp"));
+        assert!(!lists(DETAILED_USAGE, "pi"));
         let page = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("website/src/content/docs/docs/reference/cli.mdx");
         if let Ok(text) = fs::read_to_string(page) {
-            assert!(text.contains("|omp>"));
-            assert!(!text.contains("|pi>"));
+            assert!(lists(&text, "omp"));
+            assert!(!lists(&text, "pi"));
         }
     }
 }

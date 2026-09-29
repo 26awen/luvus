@@ -77,7 +77,7 @@ pub fn advertised_capabilities() -> Vec<&'static str> {
         .collect()
 }
 
-pub const FEATURES: &[&str] = &["stream_cursor"];
+pub const FEATURES: &[&str] = &["stream_cursor", "create_restore_policy"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureMode {
@@ -153,6 +153,8 @@ pub struct CreateCommit {
     pub placement: CreatePlacement,
     pub focus: bool,
     pub label: Option<String>,
+    pub restore: bool,
+    pub restore_explicit: bool,
 }
 
 /// Metadata that exists only for a successfully started PTY lifetime.
@@ -201,6 +203,8 @@ pub fn valid_id(id: &str) -> bool {
 pub enum DispatchEvidence {
     NotStarted,
     Rejected,
+    /// The PTY started, but the create was discarded before committing a pane.
+    Started,
 }
 
 impl DispatchEvidence {
@@ -208,6 +212,7 @@ impl DispatchEvidence {
         match self {
             Self::NotStarted => "not_started",
             Self::Rejected => "rejected",
+            Self::Started => "started",
         }
     }
 }

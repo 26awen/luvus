@@ -208,29 +208,34 @@ pub(crate) fn install_tui_panic_hook() {
     }));
 }
 
-/// Ask the host terminal to report **modified keys unambiguously** (the Kitty
-/// keyboard protocol, via crossterm's `DISAMBIGUATE_ESCAPE_CODES`).
+/// Ask the host terminal to report modified keys unambiguously and preserve
+/// functional-key press/repeat/release phases (Kitty flags 1 and 2).
 ///
-/// Legacy terminal encoding has no room for modifiers on `Enter`: the terminal
-/// sends a bare `CR` for Enter *and* Shift+Enter, so luvus literally cannot tell
-/// them apart and an agent's "new line, don't submit" key never works. With this
-/// pushed, a capable terminal (Ghostty, Kitty, WezTerm, foot, rio, recent
-/// iTerm2) reports `Shift+Enter` as its own key, which `encode_key` forwards to
-/// the pane as `ESC CR`.
+/// Legacy encoding sends a bare `CR` for Enter *and* Shift+Enter, so Luvus
+/// could not tell them apart. Flag 1 keeps them distinct. Flag 2 lets nested
+/// applications that ask Luvus for `REPORT_EVENT_TYPES` receive real repeat and
+/// release events, and lets Luvus stop independent UI actions from repeating
+/// while a key is held. Text-producing keys and legacy Enter/Tab/Backspace stay
+/// ordinary bytes unless a nested application also asks for report-all.
 ///
-/// Only `DISAMBIGUATE_ESCAPE_CODES` is requested — deliberately *not*
-/// `REPORT_EVENT_TYPES` (key-release events) or `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-/// (which would stop plain text arriving as `Char`). Pushed only when the
-/// terminal advertises support, so nothing is emitted into a terminal that would
-/// print it as garbage, and popped on teardown (including the panic hook).
+/// Flags 4/8/16 are not requested: Crossterm 0.29 does not expose complete
+/// alternate-key or associated-text payloads, and report-all would stop plain
+/// text arriving as `Char`. Pushed only when the terminal advertises support,
+/// so nothing is emitted into a terminal that would print it as garbage, and
+/// popped on teardown (including the panic hook).
 pub(crate) fn push_key_protocol() {
     use ratatui::crossterm::terminal::supports_keyboard_enhancement;
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(
             std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(host_keyboard_enhancement_flags())
         );
     }
+}
+
+fn host_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
 /// Raise a desktop notification for terminals that show one (iTerm2, etc.).
@@ -1756,6 +1761,16 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    #[test]
+    fn host_keyboard_protocol_requests_only_crossterm_lossless_flags() {
+        let flags = host_keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
 
     #[test]
     fn stale_server_version_fails_before_binary_attach() {
@@ -2391,18 +2406,18 @@ mod tests {
         assert!(text.contains("NORMAL"), "status mode missing");
     }
 
-    /// Naming a pane (via `pane name` / `agent name`) shows the name on the pane's
-    /// title strip in place of its cwd path, so a named pane is visibly renamed.
+    /// Naming a pane (via `pane name` / `agent name`) uses the same visible title
+    /// identity in a lone-pane header as it does on a split-pane border.
     #[test]
     fn naming_a_pane_renames_its_title() {
+        let _env = crate::persist::test_env("named-lone-pane-title");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         thread::sleep(Duration::from_millis(120));
-        // Pane titles only render when a tab has more than one (bordered) pane.
-        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
-            .unwrap();
         let pane = app.layout().focus;
         app.agent_names.insert("apisvc".into(), pane);
+        app.config.layout.show_titles = true;
+        app.config.layout.pane_title_path = false;
 
         let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
@@ -2415,22 +2430,22 @@ mod tests {
             .collect();
         assert!(
             text.contains("apisvc"),
-            "a named pane's title should show its name"
+            "a named lone pane's title should show its name"
         );
     }
 
-    /// With the `pane_title_path` setting on, a named pane's title appends its cwd
-    /// path after the name; off (default) it shows just the name.
+    /// The shared path setting applies to the same named title in lone and split
+    /// layouts; off (default) leaves only the pane identity.
     #[test]
     fn pane_title_path_setting_appends_the_path() {
         let _env = crate::persist::test_env("pane-title-path");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         thread::sleep(Duration::from_millis(120));
-        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
-            .unwrap();
         let pane = app.layout().focus;
+        app.panes.get_mut(&pane).unwrap().cwd = PathBuf::from("shared-title-cwd-probe");
         app.agent_names.insert("svcx".into(), pane);
+        app.config.layout.show_titles = true;
 
         let render = |app: &mut App| -> String {
             let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
@@ -2449,16 +2464,75 @@ mod tests {
         let off = render(&mut app);
         assert!(off.contains("svcx"), "named pane shows its name");
         assert!(
-            !off.contains("svcx  "),
+            !off.contains("svcx · shared-title-cwd-probe"),
             "default title is the name alone, without the path"
         );
 
-        // Setting on: the path follows the name.
+        // Setting on: the path follows the name in the lone-pane header.
         app.config.layout.pane_title_path = true;
         let on = render(&mut app);
         assert!(
-            on.contains("svcx  "),
+            on.contains("svcx · shared-title-cwd-probe"),
             "with pane_title_path on, the title appends the path after the name"
+        );
+
+        // Splitting changes only the title's container, not its resolved text.
+        app.dispatch("pane.split", &serde_json::Value::Object(Default::default()))
+            .unwrap();
+        let split = render(&mut app);
+        assert!(
+            split.contains("svcx · shared-title-cwd-probe"),
+            "split panes use the same title resolver"
+        );
+    }
+
+    /// An unnamed pane remains identifiable, while disabling pane titles also
+    /// reclaims the lone header row for terminal content.
+    #[test]
+    fn unnamed_lone_pane_title_uses_id_and_honors_visibility() {
+        let _env = crate::persist::test_env("unnamed-lone-pane-title");
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let mut app = App::new(80, 24, tx).expect("spawn pane");
+        thread::sleep(Duration::from_millis(120));
+        let pane = app.layout().focus;
+        let fallback = format!("p{}", pane.0);
+        app.config.layout.pane_title_path = false;
+
+        let render = |app: &mut App| -> String {
+            let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
+            term.draw(|f| ui::render(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        app.config.layout.show_titles = true;
+        let shown = render(&mut app);
+        let shown_height = app
+            .pane_content_rects
+            .iter()
+            .find_map(|(id, rect)| (*id == pane).then_some(rect.height))
+            .expect("focused pane content geometry");
+        assert!(
+            shown.contains(&fallback),
+            "unnamed pane shows its stable ID"
+        );
+
+        app.config.layout.show_titles = false;
+        let hidden = render(&mut app);
+        let hidden_height = app
+            .pane_content_rects
+            .iter()
+            .find_map(|(id, rect)| (*id == pane).then_some(rect.height))
+            .expect("focused pane content geometry");
+        assert!(!hidden.contains(&fallback), "hidden title is not rendered");
+        assert_eq!(
+            hidden_height,
+            shown_height + 1,
+            "hiding a lone title returns its row to terminal content"
         );
     }
 

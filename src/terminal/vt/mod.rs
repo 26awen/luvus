@@ -305,6 +305,19 @@ pub struct RetainedRowLayout {
     has_text: bool,
 }
 
+/// Terminal-only evidence for Claude's live composer.
+///
+/// A full-width divider typed inside a multiline prompt has the same terminal
+/// geometry as a stale compact composer. Keep that case explicit so callers
+/// can require a trusted Claude lifecycle signal instead of guessing from
+/// visible text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeComposerEvidence {
+    Absent,
+    Ready,
+    Ambiguous,
+}
+
 impl RetainedRowLayout {
     pub(crate) fn new(whitespace: Vec<bool>, has_text: bool) -> Self {
         Self {
@@ -359,6 +372,12 @@ pub trait VtEngine: Send {
     /// Detect Codex's live composer around the cursor. Returns `None` for
     /// scrollback, unrelated terminal content, or an incomplete layout.
     fn codex_composer_region(&self) -> Option<CodexComposerRegion>;
+
+    /// Inspect Claude's live input bounded by composer rails, not a menu choice.
+    fn claude_composer_evidence(&self) -> ClaudeComposerEvidence;
+
+    /// Inspect OpenCode's live input box around the cursor.
+    fn opencode_composer_ready(&self) -> bool;
 
     /// Visit every visible cell as `(row, col, symbol, style)`. `symbol` is the
     /// cell's full grapheme cluster (base char + any combining/VS16/ZWJ chars),
@@ -473,7 +492,19 @@ pub trait VtEngine: Send {
 
     /// Visit retained rows oldest-first using one reusable line buffer. The
     /// callback must not retain the borrowed text after it returns.
-    fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str));
+    fn for_each_retained_row(&self, f: &mut dyn FnMut(usize, &str)) {
+        self.try_for_each_retained_row(&mut |index, line| {
+            f(index, line);
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
+    /// Visit retained rows as above, allowing the callback to stop before the
+    /// engine formats any remaining rows.
+    fn try_for_each_retained_row(
+        &self,
+        f: &mut dyn FnMut(usize, &str) -> std::ops::ControlFlow<()>,
+    );
 
     /// Extract an inclusive linear retained-row selection using terminal cell
     /// coordinates. Implementations must preserve complete wide glyphs and

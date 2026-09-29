@@ -151,6 +151,7 @@ impl App {
     pub(super) fn api_agent_send(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
+            reject_api_fields(p, &["target", "text", "strict", "terminal_id"])?;
             let id = self.resolve_agent_target(p)?;
             if !self.is_agent_pane(id) {
                 return Err((
@@ -165,15 +166,26 @@ impl App {
                     "agent send text must not be empty".to_string(),
                 ));
             }
-            if !self.agent_prompt_is_ready(id) {
-                return Err(super::agent_workflow::agent_prompt_not_ready_error());
-            }
+            let strict = match p.get("strict") {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err((
+                        "invalid_request".to_string(),
+                        "strict must be a boolean".to_string(),
+                    ));
+                }
+            };
             let pane = self.panes.get(&id).ok_or_else(|| {
                 (
                     "send_failed".to_string(),
                     "target pane closed before input was queued".to_string(),
                 )
             })?;
+            check_agent_terminal_id(p, pane)?;
+            if !self.agent_prompt_is_ready(id, strict) {
+                return Err(super::agent_workflow::agent_prompt_not_ready_error());
+            }
             pane.try_submit_text_with_settle(text, AGENT_MESSAGE_SETTLE)
                 .map_err(|message| ("send_failed".to_string(), message))?;
             let (agent, status) = self
@@ -471,6 +483,14 @@ impl App {
                 let changed = status.state != state || status.agent != agent;
                 status.agent = agent.to_string();
                 status.state = state;
+                // Reports can change admission without any new terminal bytes.
+                status.prompt_evidence = if state == State::Blocked {
+                    detect::PromptEvidence::Blocked
+                } else {
+                    detect::PromptEvidence::Unknown
+                };
+                status.force_detect = true;
+                status.last_detect_generation = None;
                 status.candidate = state;
                 status.candidate_since = now;
                 status.prev_working = state == State::Working;

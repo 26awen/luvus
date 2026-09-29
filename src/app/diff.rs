@@ -512,6 +512,10 @@ impl App {
     /// Navigate the DIFF list while the shared FILES/DIFF dock owns keyboard
     /// focus. Opening a review returns normal keys to the new native view.
     pub fn handle_diff_list_key(&mut self, key: KeyEvent) -> bool {
+        // Filter cycling and refresh stay in this list; hold them once.
+        if super::is_key_repeat(&key) && matches!(key.code, KeyCode::Char('f' | 'r')) {
+            return true;
+        }
         let page = self.diff.viewport.max(1) as isize;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.files_focused = false,
@@ -798,6 +802,7 @@ impl App {
                     .position(|line| source_anchor(line) == Some(anchor))
             })
             .unwrap_or(0);
+        view.search_refresh();
         if let Some(diff) = cache {
             let mut fingerprint = String::new();
             if let Some(file) =
@@ -1688,6 +1693,43 @@ impl App {
             let Some(ViewKind::Diff(view)) = self.views.get_mut(&id) else {
                 return false;
             };
+            // A held key repeats continuous navigation and text editing only.
+            // Toggles, note mutations, file jumps, refreshes, and agent sends
+            // leave this DIFF receiver active, so their repeats do nothing.
+            if super::is_key_repeat(&key) {
+                let ctrl = super::keys::is_ctrl_chord(key.modifiers);
+                let action = if view.note_draft.is_some() || view.note_selecting {
+                    false
+                } else if view.search.is_some() {
+                    ctrl && key.code == KeyCode::Char('i')
+                } else {
+                    matches!(
+                        key.code,
+                        KeyCode::Char(
+                            's' | 'w'
+                                | 'v'
+                                | '+'
+                                | '='
+                                | '-'
+                                | 'J'
+                                | 'K'
+                                | 'N'
+                                | 'P'
+                                | ' '
+                                | 'e'
+                                | 'x'
+                                | 'D'
+                                | 'a'
+                                | 'r'
+                                | 'm'
+                                | 'f'
+                        )
+                    )
+                };
+                if action {
+                    return false;
+                }
+            }
             if view.note_draft.is_some() {
                 match key.code {
                     KeyCode::Char(c) => {
@@ -1763,33 +1805,37 @@ impl App {
                     view.scroll = view.selected.saturating_sub(viewport.saturating_sub(1));
                 }
                 view.ensure_horizontal_visible(pane_width, marker_style, is_split);
-            } else if view.search_editing {
+            } else if view.search.is_some() {
+                let editing = view.search.as_ref().is_some_and(|search| search.editing);
                 match key.code {
-                    KeyCode::Char(c) => view.search.get_or_insert_with(String::new).push(c),
-                    KeyCode::Backspace => {
-                        view.search.get_or_insert_with(String::new).pop();
-                    }
-                    KeyCode::Enter => {
-                        view.search_editing = false;
-                        if let Some(query) =
-                            view.search.as_deref().filter(|query| !query.is_empty())
-                        {
-                            if let Some(index) = view
-                                .stack_rows
-                                .iter()
-                                .position(|line| line.text.contains(query))
-                            {
-                                view.selected = index;
-                                view.scroll = index.saturating_sub(viewport / 2);
-                                view.ensure_horizontal_visible(pane_width, marker_style, is_split);
-                            }
+                    KeyCode::Char('i') if super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_toggle_case();
+                        if !editing {
+                            view.scroll = view.selected.saturating_sub(viewport / 2);
                         }
                     }
-                    KeyCode::Esc => {
-                        view.search = None;
-                        view.search_editing = false;
+                    KeyCode::Char('u') if super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_clear()
                     }
-                    _ => return false,
+                    KeyCode::Char(c) if editing && !super::keys::is_ctrl_chord(key.modifiers) => {
+                        view.search_push(c)
+                    }
+                    KeyCode::Backspace if editing => view.search_backspace(),
+                    KeyCode::Enter if editing => {
+                        view.search_commit();
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                        view.ensure_horizontal_visible(pane_width, marker_style, is_split);
+                    }
+                    KeyCode::Char('n') if !editing => {
+                        view.search_step(true);
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                    }
+                    KeyCode::Char('N') if !editing => {
+                        view.search_step(false);
+                        view.scroll = view.selected.saturating_sub(viewport / 2);
+                    }
+                    KeyCode::Esc => view.search = None,
+                    _ => {}
                 }
             } else {
                 let row_count = view.stack_rows.len();
@@ -1872,10 +1918,7 @@ impl App {
                             view.ensure_horizontal_visible(pane_width, marker_style, is_split);
                         }
                     }
-                    KeyCode::Char('/') => {
-                        view.search = Some(String::new());
-                        view.search_editing = true;
-                    }
+                    KeyCode::Char('/') => view.search_begin(),
                     KeyCode::Char('v') => {
                         view.range_anchor = match (view.range_anchor, current_anchor) {
                             (Some(_), _) => None,
@@ -1896,11 +1939,7 @@ impl App {
                     KeyCode::Char('m') => deferred = Deferred::Viewed,
                     KeyCode::Char('f') => deferred = Deferred::Filter,
                     KeyCode::Char('q') => deferred = Deferred::Close,
-                    KeyCode::Esc => {
-                        if view.search.take().is_none() {
-                            deferred = Deferred::Close;
-                        }
-                    }
+                    KeyCode::Esc => deferred = Deferred::Close,
                     _ => return false,
                 }
                 if view.selected < view.scroll {
@@ -2192,6 +2231,42 @@ mod tests {
             app.prepare_diff_api(cached).is_some(),
             "a matching cached snapshot never waits on Git"
         );
+    }
+
+    #[test]
+    fn diff_search_consumes_non_search_shortcuts_before_and_after_commit() {
+        let _env = crate::persist::test_env("diff-search-input-owner");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let key = install_snapshot(&mut app);
+        app.open_diff_view(key, OpenTarget::Tab);
+        let id = app.layout().focus;
+        let tab_count = app.ws().tabs.len();
+        let preference = match app.views.get(&id) {
+            Some(ViewKind::Diff(view)) => view.preference,
+            _ => panic!("expected DIFF view"),
+        };
+
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)));
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)));
+        assert!(matches!(
+            app.views.get(&id),
+            Some(ViewKind::Diff(view)) if view.search.as_ref().is_some_and(|search| search.query.is_empty())
+        ));
+
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert!(app.handle_diff_key(id, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        for shortcut in ['q', 's', 'm', 'a'] {
+            assert!(app.handle_diff_key(
+                id,
+                KeyEvent::new(KeyCode::Char(shortcut), KeyModifiers::NONE)
+            ));
+        }
+        assert_eq!(app.ws().tabs.len(), tab_count, "q must not close DIFF");
+        assert!(matches!(
+            app.views.get(&id),
+            Some(ViewKind::Diff(view)) if view.search.is_some() && view.preference == preference
+        ));
     }
 
     #[test]
@@ -2800,6 +2875,123 @@ mod tests {
             app.views.get(&id),
             Some(ViewKind::Diff(view)) if view.selected == 3 && view.scroll == 3
         ));
+    }
+
+    fn seed_saved_note(app: &mut App) -> (PaneId, usize) {
+        let key = install_snapshot(app);
+        app.open_diff_view(key.clone(), OpenTarget::Tab);
+        let id = app.layout().focus;
+        let changed = DiffLine {
+            kind: DiffLineKind::Addition,
+            old_line: None,
+            new_line: Some(8),
+            text: "let corrected = true;".into(),
+        };
+        let file_diff = FileDiff {
+            key: key.clone(),
+            status: DiffFileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            truncated: false,
+            omitted_lines: 0,
+            hunks: vec![DiffHunk {
+                id: "hunk".into(),
+                old_start: 7,
+                new_start: 8,
+                header: "@@ -7,0 +8 @@".into(),
+                lines: vec![changed],
+            }],
+        };
+        let stack_rows = crate::diff::rows::stack_rows(&file_diff);
+        let split_rows = crate::diff::rows::split_rows(&file_diff);
+        let selected = stack_rows
+            .iter()
+            .position(|line| line.new_line == Some(8))
+            .expect("new source row");
+        let Some(ViewKind::Diff(view)) = app.views.get_mut(&id) else {
+            panic!("native DIFF view");
+        };
+        view.preference = crate::diff::DiffLayoutPreference::Stack;
+        view.stack_rows = stack_rows;
+        view.split_rows = split_rows;
+        view.selected = selected;
+        view.load = DiffLoad::Ready(Arc::new(file_diff));
+        app.diff.notes.push(crate::diff::ReviewNote {
+            id: "clicked-note".into(),
+            review_id: "review".into(),
+            author: "user".into(),
+            kind: crate::diff::NoteKind::Issue,
+            body: "Please keep this behavior".into(),
+            anchor: crate::diff::notes::NoteAnchor {
+                diff_key: key,
+                side: crate::diff::DiffSide::New,
+                start_line: 8,
+                end_line: 8,
+                context: "let corrected = true;".into(),
+                context_sha256: "hash".into(),
+            },
+            state: crate::diff::NoteState::Open,
+            deliveries: Vec::new(),
+            revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        (id, selected)
+    }
+
+    #[test]
+    fn diff_view_left_and_right_repeat_source_side_selection() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("diff-side-navigation");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        let (id, _) = seed_saved_note(&mut app);
+        let side = |app: &App| match app.views.get(&id) {
+            Some(ViewKind::Diff(view)) => view.selected_side,
+            _ => panic!("native DIFF view"),
+        };
+        let event =
+            |code, kind| AppEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Press));
+        assert_eq!(side(&app), crate::diff::DiffSide::Old);
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Release));
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Press));
+        assert_eq!(side(&app), crate::diff::DiffSide::New);
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Release));
+
+        // Held navigation is continuous: the Repeat reaches the same view.
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Press));
+        app.handle_event(event(KeyCode::Right, KeyEventKind::Press));
+        app.handle_event(event(KeyCode::Left, KeyEventKind::Repeat));
+        assert_eq!(side(&app), crate::diff::DiffSide::Old);
+    }
+
+    #[test]
+    fn diff_view_space_repeat_does_not_toggle_note_selection() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let _env = crate::persist::test_env("diff-note-space-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        let _ = seed_saved_note(&mut app);
+        let event = |kind| {
+            AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+
+        app.handle_event(event(KeyEventKind::Press));
+        assert!(app.diff.selected_notes.contains("clicked-note"));
+        app.handle_event(event(KeyEventKind::Repeat));
+        assert!(
+            app.diff.selected_notes.contains("clicked-note"),
+            "held Space cannot toggle review-note send selection"
+        );
     }
 
     #[test]

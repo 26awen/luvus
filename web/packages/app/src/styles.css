@@ -119,6 +119,10 @@ button { color: inherit; }
 .section-title { margin: 0; color: #f2eff9; font-size: clamp(1.35rem, 3vw, 2rem); font-weight: 560; letter-spacing: -.035em; }
 .section-status { padding: .38rem .6rem; color: var(--green); background: #9ed68a0b; border: 1px solid #9ed68a24; border-radius: 999px; font: .58rem ui-monospace, monospace; text-transform: uppercase; letter-spacing: .08em; }
 .agent-grid { display: grid; grid-template-columns: 1fr; align-items: start; gap: .8rem; }
+.agent-filters { display: flex; gap: .2rem; padding: .2rem; border: 1px solid var(--rally-border); border-radius: 999px; }
+.agent-filter { padding: .45rem .65rem; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-size: .75rem; cursor: pointer; }
+.agent-filter[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.agent-filter:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 .workspace-grid { column-count: 1; column-gap: .8rem; }
 .agent-card, .workspace-card {
   position: relative; background: #1d1e27; border: 1px solid #ffffff17; border-radius: 1rem;
@@ -126,6 +130,8 @@ button { color: inherit; }
 }
 .agent-card { display: flex; align-items: center; gap: .8rem; min-height: 5rem; padding: .85rem 1rem; overflow: hidden; text-align: left; cursor: pointer; transition: border-color .18s ease, transform .18s ease, background .18s ease; }
 .agent-card:hover, .agent-card:focus-visible { background: #24252f; border-color: #ead77846; outline: none; transform: translateY(-2px); }
+.agent-card:disabled { cursor: default; opacity: .65; }
+.agent-card:disabled:hover { background: #1d1e27; border-color: #ffffff17; transform: none; }
 .agent-card strong, .agent-card small { display: block; }
 .agent-card .agent-context { overflow: hidden; color: var(--muted); font-size: .75rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card .agent-session-title { display: -webkit-box; margin-top: .3rem; overflow: hidden; color: #f2eff9; font-size: .95rem; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
