@@ -1488,8 +1488,9 @@ pub fn is_openable_url(url: &str) -> bool {
 ///
 /// Passed as a **separate argv entry**, never interpolated into a shell command,
 /// so a URL containing shell metacharacters is inert. Callers must have cleared
-/// it through [`is_openable_url`] first. Detached and never waited on, so a
-/// browser cold-start cannot stall the event loop.
+/// it through [`is_openable_url`] first. Started with [`spawn_reaped`], so a
+/// browser cold-start cannot stall the event loop and the opener leaves no
+/// zombie behind in a long-running client.
 pub fn open_url(url: &str) {
     use std::process::{Command, Stdio};
     if !is_openable_url(url) {
@@ -1506,20 +1507,28 @@ pub fn open_url(url: &str) {
         &[("xdg-open", &[]), ("gio", &["open"]), ("wslview", &[])]
     };
     for (cmd, args) in openers {
-        if no_window(
+        if spawn_reaped(no_window(
             Command::new(cmd)
                 .args(*args)
                 .arg(url)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
-        )
-        .spawn()
-        .is_ok()
+        ))
+        .is_some()
         {
             return;
         }
     }
+}
+
+/// Start a fire-and-forget helper and collect its exit status off the caller
+/// thread. Helpers share the event-driven PTY child reaper, so a long-running
+/// opener neither adds a waiting thread nor prevents later links from opening.
+/// Prepare and register with the reaper before spawning the child. Returns
+/// `None` if reaper setup, registration, or command startup fails.
+pub fn spawn_reaped(command: &mut std::process::Command) -> Option<u32> {
+    crate::terminal::pty::spawn_helper_reaped(command)
 }
 
 #[cfg(test)]
@@ -1644,6 +1653,28 @@ mod tests {
         });
         assert_eq!(descendants.len(), 71);
         assert!((1..=71).all(|pid| descendants.contains(&pid)));
+    }
+
+    /// A fire-and-forget opener must not stay a zombie under a long-running
+    /// client once it exits.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_helpers_are_reaped_after_they_exit() {
+        let pid = super::spawn_reaped(&mut std::process::Command::new("true"))
+            .expect("spawn a helper that exits at once");
+        // A zombie still answers signal 0; a reaped process no longer exists.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper {pid} exited but was never reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     /// The hidden-window flag must not break output capture: a command routed
