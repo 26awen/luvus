@@ -103,6 +103,10 @@ Luvus release number.
 | themes | `theme.list` · `theme.path` · `theme.use` · `theme.reload` |
 | ui / server | `ui.sidebar` · `ui.agent_title.push` · `ui.agent_title.clear` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.bar.push` · `ui.bar.list` · `ui.bar.move` · `ui.bar.remove` · `ui.notification.push` · `ui.notification.clear` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` · `events.wait` |
 
+`module.info` and `module.action.list` include an optional action `commander`
+declaration when present. It is discovery metadata for the TUI's
+`$` picker; `module.action.invoke` retains its existing input contract.
+
 Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `{"paths": ["x"]}`). For CLI commands, an omitted pane uses
 `$LUVUS_PANE_ID` when available. Except for the project-scoped task methods
