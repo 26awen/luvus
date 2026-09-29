@@ -1502,6 +1502,17 @@ impl App {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let kind = m.kind;
+        // A pane can close while it owns a forwarded gesture. Stop targeting
+        // the dead pane and remember its button so the eventual release cannot
+        // fall through as an unmatched Luvus action.
+        if self
+            .mouse_grab
+            .is_some_and(|grab| !self.panes.contains_key(&grab.pane))
+        {
+            if let Some(grab) = self.mouse_grab.take() {
+                self.suppressed_mouse_releases |= mouse_button_bit(grab.button);
+            }
+        }
         // A forwarded gesture owns the pointer until its button comes up, like
         // pointer capture. This runs before every overlay, modal, Commander,
         // copy mode, and layout control, so none of them can swallow the
@@ -1522,12 +1533,34 @@ impl App {
                     if button == g.button {
                         self.mouse_grab = None;
                         self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
+                    } else {
+                        self.suppressed_mouse_releases &= !mouse_button_bit(button);
                     }
                     return true;
                 }
-                MouseEventKind::Down(_) => return true,
+                MouseEventKind::Down(button) => {
+                    if button != g.button {
+                        self.suppressed_mouse_releases |= mouse_button_bit(button);
+                    }
+                    return true;
+                }
                 _ => {}
             }
+        }
+        match kind {
+            MouseEventKind::Up(button)
+                if self.suppressed_mouse_releases & mouse_button_bit(button) != 0 =>
+            {
+                self.suppressed_mouse_releases &= !mouse_button_bit(button);
+                return true;
+            }
+            // A new press starts a new physical gesture. If the terminal never
+            // delivered an older matching release, do not let that stale state
+            // swallow the new gesture's eventual release.
+            MouseEventKind::Down(button) => {
+                self.suppressed_mouse_releases &= !mouse_button_bit(button);
+            }
+            _ => {}
         }
         self.cancel_orphaned_pane_search();
         // Pane search is keyboard-owned too. A deliberate mouse action cancels
@@ -5372,6 +5405,15 @@ enum MouseSeq {
     Press,
     Drag,
     Release,
+}
+
+fn mouse_button_bit(button: ratatui::crossterm::event::MouseButton) -> u8 {
+    use ratatui::crossterm::event::MouseButton;
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        MouseButton::Middle => 4,
+    }
 }
 
 /// The xterm modifier bits ORed into a mouse button code: Shift +4, Alt +8,
@@ -10778,6 +10820,135 @@ mod link_click_tests {
         assert!(
             app.mouse_grab.is_none(),
             "the search-cancelling click is swallowed"
+        );
+    }
+
+    /// A secondary press swallowed by pointer capture must keep owning its
+    /// eventual release after the primary gesture ends. Otherwise that release
+    /// can resize and recopy a retained Luvus selection without a Luvus press.
+    #[test]
+    fn secondary_release_cannot_escape_a_finished_forwarded_gesture() {
+        let _env = crate::persist::test_env("grab-secondary-release");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        enable_mouse_tracking(&app, pane);
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .expect("pane content rect");
+        app.selection = Some(crate::app::Selection {
+            pane,
+            content,
+            anchor: (content.x, content.y),
+            cursor: (content.x + 2, content.y),
+            retained: None,
+            scrolled: false,
+            dragging: false,
+        });
+        let before = app.selection.expect("retained selection");
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (content.x + 8, content.y),
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            (content.x + 8, content.y),
+            KeyModifiers::NONE,
+        ));
+
+        let after = app.selection.expect("selection remains highlighted");
+        assert_eq!(after.pane, before.pane);
+        assert_eq!(after.content, before.content);
+        assert_eq!(after.anchor, before.anchor);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(
+            after
+                .retained
+                .map(|selection| (selection.anchor, selection.cursor)),
+            before
+                .retained
+                .map(|selection| (selection.anchor, selection.cursor))
+        );
+        assert_eq!(after.scrolled, before.scrolled);
+        assert_eq!(after.dragging, before.dragging);
+        assert!(app.pending_clipboard.is_none());
+        assert!(app.mouse_grab.is_none());
+        assert_eq!(app.suppressed_mouse_releases, 0);
+    }
+
+    /// Closing a pane cannot leave its forwarded pointer grab capturing later
+    /// input. The orphaned release is swallowed, then a fresh click reaches the
+    /// surviving pane normally.
+    #[test]
+    fn closing_the_grabbed_pane_does_not_capture_later_clicks() {
+        let _env = crate::persist::test_env("grab-closed-pane");
+        let Fixture {
+            mut app,
+            mut term,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        let survivor = app
+            .split_pane(pane, crate::layout::Axis::Col, false)
+            .expect("surviving pane");
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        enable_mouse_tracking(&app, pane);
+        enable_mouse_tracking(&app, survivor);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.mouse_grab.map(|grab| grab.pane), Some(pane));
+
+        app.close_pane(pane);
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let survivor_content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == survivor)
+            .map(|(_, rect)| *rect)
+            .expect("survivor content rect");
+        let inside = (survivor_content.x + 1, survivor_content.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Right),
+            inside,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.mouse_grab.is_none());
+        assert_eq!(app.suppressed_mouse_releases, 0);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inside,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.mouse_grab.map(|grab| (grab.pane, grab.button)),
+            Some((survivor, MouseButton::Left))
         );
     }
 

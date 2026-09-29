@@ -2938,6 +2938,10 @@ pub struct App {
     /// drags and releases touch no engine lock (the PTY reader holds that mutex
     /// during output bursts).
     pub mouse_grab: Option<MouseGrab>,
+    /// Buttons pressed while another forwarded mouse gesture owned the pointer.
+    /// Their matching releases must remain swallowed even if the owning gesture
+    /// ends first, or an unmatched release can mutate a Luvus selection.
+    suppressed_mouse_releases: u8,
     /// Text to copy to the client's system clipboard (via OSC 52) — set when a
     /// selection finishes, drained + broadcast by the loop.
     pub pending_clipboard: Option<String>,
@@ -3588,6 +3592,7 @@ impl App {
             selection_clear_at: None,
             copy_mode: None,
             mouse_grab: None,
+            suppressed_mouse_releases: 0,
             pending_clipboard: None,
             pending_open_url: None,
             link_scan_at: None,
@@ -4310,6 +4315,7 @@ impl App {
             selection_clear_at: None,
             copy_mode: None,
             mouse_grab: None,
+            suppressed_mouse_releases: 0,
             pending_clipboard: None,
             pending_open_url: None,
             link_scan_at: None,
