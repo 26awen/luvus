@@ -5,12 +5,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{OriginalUri, State};
+use axum::extract::{OriginalUri, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN, REFERRER_POLICY,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN, REFERRER_POLICY,
     X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -21,10 +22,14 @@ use tokio::sync::{broadcast, mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use super::assets;
-use super::auth::{BrowserAuthority, BrowserDeviceStatus};
+use super::auth::{BrowserAuthority, BrowserDeviceStatus, LimitError};
 use super::uhp::{is_streaming, read_line, UhpAccess, UhpError};
 
 const MAX_CLIENTS: usize = 8;
+/// WebSockets still inside their bounded authentication window. They hold no
+/// authority, but each one costs a task and a socket, so their number is capped
+/// separately from authenticated clients.
+const MAX_PENDING: usize = 16;
 const MAX_PAYLOAD: usize = 256 * 1024;
 const MAX_STREAMS: usize = 3;
 const OUTBOUND_FRAMES: usize = 128;
@@ -71,10 +76,47 @@ impl Outbound {
 pub(super) struct BridgeState {
     authority: Arc<Mutex<BrowserAuthority>>,
     uhp: Arc<UhpAccess>,
-    origins: Arc<Vec<String>>,
+    /// Exact WebSocket origins allowed besides the page's own host.
+    origins: Arc<Mutex<Vec<String>>>,
+    /// Host header values this bridge answers to. See [`allowed_hosts`]. Only
+    /// the operator can extend it, from the command line or by pasting a remote
+    /// origin into the bridge's terminal ([`Self::allow_remote_origin`]). A
+    /// browser changing the pairing address never widens it.
+    hosts: Arc<Mutex<Vec<String>>>,
     public_url: Arc<Mutex<Option<String>>>,
     devices: broadcast::Sender<Value>,
     connected: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Releases a ticket's live-connection count when its WebSocket ends, so the
+/// operator can reclaim a device slot only once the device has disconnected.
+struct LiveTicket {
+    authority: Arc<Mutex<BrowserAuthority>>,
+    digest: [u8; 32],
+}
+
+impl LiveTicket {
+    /// Returns `None` when the ticket no longer exists, for example because
+    /// the operator reclaimed it after this socket authenticated.
+    fn open(authority: &Arc<Mutex<BrowserAuthority>>, digest: [u8; 32]) -> Option<Self> {
+        let connected = authority
+            .lock()
+            .expect("browser authority poisoned")
+            .connect(&digest);
+        connected.then(|| Self {
+            authority: Arc::clone(authority),
+            digest,
+        })
+    }
+}
+
+impl Drop for LiveTicket {
+    fn drop(&mut self) {
+        if let Ok(mut authority) = self.authority.lock() {
+            authority.disconnect(&self.digest);
+        }
+    }
 }
 
 struct ConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -103,17 +145,52 @@ impl BridgeState {
         authority: BrowserAuthority,
         uhp: Arc<UhpAccess>,
         origins: Vec<String>,
+        hosts: Vec<String>,
         public_url: Option<String>,
     ) -> Self {
         let (devices, _) = broadcast::channel(16);
         Self {
             authority: Arc::new(Mutex::new(authority)),
             uhp,
-            origins: Arc::new(origins),
+            origins: Arc::new(Mutex::new(origins)),
+            hosts: Arc::new(Mutex::new(hosts)),
             public_url: Arc::new(Mutex::new(public_url)),
             devices,
             connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Create a one-use pairing link for the operator at the bridge's
+    /// terminal, freeing one unused or idle slot if the limit is full.
+    pub fn operator_pairing(
+        &self,
+    ) -> Result<(super::auth::BrowserPairing, super::auth::Reclaimed), super::auth::Full> {
+        let result = self
+            .authority
+            .lock()
+            .expect("browser authority poisoned")
+            .create_operator_pairing();
+        self.broadcast_devices();
+        result
+    }
+
+    /// Allow a remote HTTPS origin, such as a tunnel address that is only known
+    /// after the bridge started, and make it the pairing address.
+    ///
+    /// Only the operator can call this, by pasting the origin into the terminal
+    /// running the bridge. That terminal already holds full authority, so it is
+    /// the right place to widen what the bridge answers to; a paired browser
+    /// cannot. `origin` must already be normalized by
+    /// [`normalize_public_origin`].
+    pub fn allow_remote_origin(&self, origin: &str) {
+        allow_origin(
+            &mut self.origins.lock().expect("web origins poisoned"),
+            &mut self.hosts.lock().expect("web hosts poisoned"),
+            origin,
+        );
+        *self.public_url.lock().expect("browser public URL poisoned") = Some(origin.to_string());
+        self.broadcast_devices();
     }
 
     fn device_status(&self) -> Value {
@@ -140,7 +217,45 @@ pub(super) fn router(state: BridgeState) -> Router {
         .route("/bridge", get(websocket))
         .route("/healthz", get(health))
         .fallback(get(asset).head(asset))
+        // Outermost, so it guards every route including the asset fallback.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_known_host,
+        ))
         .with_state(state)
+}
+
+/// Reject any request whose Host header is not one this bridge serves.
+///
+/// The bridge listens on loopback, but a malicious web page can point its own
+/// domain at 127.0.0.1 (DNS rebinding). The browser then sends that domain as
+/// the Host, and the page could reach the bridge as a same-origin client. It
+/// still could not authenticate without a pairing code or ticket, but it must
+/// not get that far: only loopback names on the bound port, plus origins the
+/// operator configured at startup, are answered.
+async fn require_known_host(
+    State(state): State<BridgeState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    let known = host
+        .is_some_and(|host| host_allowed(host, &state.hosts.lock().expect("web hosts poisoned")));
+    if known {
+        return next.run(request).await;
+    }
+    let mut response = (
+        StatusCode::FORBIDDEN,
+        "Luvus Web does not answer to this host name. To reach it through a \
+         tunnel or proxy, paste that HTTPS address into the terminal running \
+         luvus web, or restart it with the address in --public-url or --origin.\n",
+    )
+        .into_response();
+    set_security_headers(response.headers_mut());
+    response
 }
 
 async fn health() -> impl IntoResponse {
@@ -184,18 +299,28 @@ async fn websocket(
     State(state): State<BridgeState>,
     headers: HeaderMap,
 ) -> Response {
-    if !origin_allowed(&headers, &state.origins) {
+    let allowed = origin_allowed(
+        &headers,
+        &state.origins.lock().expect("web origins poisoned"),
+    );
+    if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // Held through the authentication window and released once the socket
+    // either authenticates or is closed, so unauthenticated sockets cannot
+    // pile up without bound.
+    let Some(pending) = ConnectionGuard::acquire(&state.pending, MAX_PENDING) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     upgrade
         .max_message_size(MAX_PAYLOAD)
         .max_frame_size(MAX_PAYLOAD)
         .on_upgrade(move |socket| async move {
-            client(socket, state).await;
+            client(socket, state, pending).await;
         })
 }
 
-async fn client(socket: WebSocket, state: BridgeState) {
+async fn client(socket: WebSocket, state: BridgeState, pending: ConnectionGuard) {
     let (mut sink, mut source) = socket.split();
     let authenticated = tokio::time::timeout(Duration::from_secs(5), source.next()).await;
     let Some(Ok(Message::Text(text))) = authenticated.ok().flatten() else {
@@ -242,6 +367,19 @@ async fn client(socket: WebSocket, state: BridgeState) {
                 "type": "error",
                 "code": "connection_limit",
                 "message": "Authenticated browser capacity is full",
+            })))
+            .await;
+        let _ = sink.send(Message::Close(None)).await;
+        return;
+    };
+    // Authenticated: this socket now counts against the client budget instead.
+    drop(pending);
+    let Some(_live) = LiveTicket::open(&state.authority, authentication.ticket_digest) else {
+        let _ = sink
+            .send(text_message(json!({
+                "type": "error",
+                "code": "forbidden",
+                "message": "Pairing or ticket was rejected",
             })))
             .await;
         let _ = sink.send(Message::Close(None)).await;
@@ -519,18 +657,29 @@ fn device_request(
                     "Device limit must be from 1 through 8",
                 );
             }
-            if !state
+            let changed = state
                 .authority
                 .lock()
                 .expect("browser authority poisoned")
-                .set_max_devices(limit as usize)
-            {
-                return response_error(
-                    outgoing,
-                    id,
-                    "device_limit",
-                    "Device limit cannot be lower than paired devices and pending links",
-                );
+                .set_max_devices(limit as usize);
+            match changed {
+                Ok(()) => {}
+                Err(LimitError::BelowUsed) => {
+                    return response_error(
+                        outgoing,
+                        id,
+                        "device_limit",
+                        "Device limit cannot be lower than paired devices and pending links",
+                    );
+                }
+                Err(LimitError::AboveCeiling) => {
+                    return response_error(
+                        outgoing,
+                        id,
+                        "forbidden",
+                        "Device limit cannot exceed the --max-devices value the bridge was started with",
+                    );
+                }
             }
             response_result(outgoing, id, state.device_status())?;
             state.broadcast_devices();
@@ -897,8 +1046,64 @@ fn device_status(status: BrowserDeviceStatus, public_url: Option<&str>) -> Value
         "paired_devices": status.paired_devices,
         "pending_pairings": status.pending_pairings,
         "max_devices": status.max_devices,
+        "limit_ceiling": status.limit_ceiling,
         "public_url": public_url,
     })
+}
+
+/// The Host header values the bridge answers to: the loopback names on the
+/// bound port, plus the hosts of `--public-url` and every `--origin`. Built
+/// once at startup from the command line, so a paired browser cannot add one.
+pub(super) fn allowed_hosts(
+    port: u16,
+    public_url: Option<&str>,
+    origins: &[String],
+) -> Vec<String> {
+    // Canonical like the incoming Host, so ports 80 and 443 match too.
+    let mut hosts = vec![
+        canonical_host(&format!("127.0.0.1:{port}")),
+        canonical_host(&format!("localhost:{port}")),
+    ];
+    for origin in public_url
+        .into_iter()
+        .chain(origins.iter().map(String::as_str))
+    {
+        if let Some((_, authority)) = origin.split_once("://") {
+            hosts.push(canonical_host(authority));
+        }
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Exact, case-insensitive Host match. Default ports are dropped on both sides
+/// because a browser omits them from Host while an origin may spell them out.
+/// Add one exact origin and its host name, without duplicates.
+fn allow_origin(origins: &mut Vec<String>, hosts: &mut Vec<String>, origin: &str) {
+    if !origins.iter().any(|allowed| allowed == origin) {
+        origins.push(origin.to_string());
+    }
+    if let Some((_, authority)) = origin.split_once("://") {
+        let host = canonical_host(authority);
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+}
+
+pub(super) fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = canonical_host(host.trim());
+    !host.is_empty() && allowed.contains(&host)
+}
+
+fn canonical_host(authority: &str) -> String {
+    let lower = authority.to_ascii_lowercase();
+    lower
+        .strip_suffix(":443")
+        .or_else(|| lower.strip_suffix(":80"))
+        .unwrap_or(&lower)
+        .to_string()
 }
 
 fn origin_allowed(headers: &HeaderMap, configured: &[String]) -> bool {
@@ -920,6 +1125,10 @@ fn origin_allowed(headers: &HeaderMap, configured: &[String]) -> bool {
 }
 
 pub(super) fn normalize_origin(value: &str) -> Option<String> {
+    // The URI parser silently drops a fragment; an origin never has one.
+    if value.contains('#') {
+        return None;
+    }
     let uri = value.parse::<axum::http::Uri>().ok()?;
     let scheme = uri.scheme_str()?;
     if !matches!(scheme, "http" | "https") || uri.query().is_some() {
@@ -976,6 +1185,94 @@ mod tests {
             Some("https://phone.example:443".to_string())
         );
         assert!(normalize_public_origin("http://phone.example").is_none());
+    }
+
+    /// DNS rebinding points an attacker's domain at 127.0.0.1, so the browser
+    /// sends that domain as Host. Only loopback names on the bound port and
+    /// origins configured at startup may be answered.
+    #[test]
+    fn only_loopback_and_configured_hosts_are_answered() {
+        let hosts = allowed_hosts(4174, None, &[]);
+        assert!(host_allowed("127.0.0.1:4174", &hosts));
+        assert!(host_allowed("LOCALHOST:4174", &hosts), "case-insensitive");
+        assert!(!host_allowed("127.0.0.1:4175", &hosts), "another port");
+        assert!(!host_allowed("127.0.0.1", &hosts), "no port");
+        assert!(!host_allowed("evil.example:4174", &hosts), "rebound domain");
+        assert!(!host_allowed("", &hosts));
+
+        let origins = vec!["https://backup.example".to_string()];
+        let hosts = allowed_hosts(4174, Some("https://phone.example:443"), &origins);
+        assert!(
+            host_allowed("phone.example", &hosts),
+            "a browser omits the default port that the origin spelled out"
+        );
+        assert!(host_allowed("phone.example:443", &hosts));
+        assert!(host_allowed("backup.example", &hosts));
+        assert!(
+            !host_allowed("phone.example.evil", &hosts),
+            "exact match only"
+        );
+        assert!(!host_allowed("sub.phone.example", &hosts), "no subdomains");
+    }
+
+    /// A tunnel address pasted by the operator is answered exactly, both as a
+    /// host name and as a WebSocket origin, and only once in each list.
+    #[test]
+    fn a_pasted_remote_origin_is_answered_exactly() {
+        let mut origins = Vec::new();
+        let mut hosts = allowed_hosts(4174, None, &origins);
+        assert!(!host_allowed("abc.ngrok-free.app", &hosts));
+
+        allow_origin(&mut origins, &mut hosts, "https://abc.ngrok-free.app");
+        allow_origin(&mut origins, &mut hosts, "https://abc.ngrok-free.app");
+        assert_eq!(origins, vec!["https://abc.ngrok-free.app".to_string()]);
+        assert_eq!(hosts.len(), 3, "loopback pair plus the tunnel host");
+        assert!(host_allowed("abc.ngrok-free.app", &hosts));
+        assert!(host_allowed("abc.ngrok-free.app:443", &hosts));
+        assert!(!host_allowed("abc.ngrok-free.app:8443", &hosts));
+        assert!(!host_allowed("x.abc.ngrok-free.app", &hosts));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://abc.ngrok-free.app"),
+        );
+        assert!(origin_allowed(&headers, &origins));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("http://abc.ngrok-free.app"),
+        );
+        assert!(!origin_allowed(&headers, &origins), "scheme must match");
+    }
+
+    #[test]
+    fn loopback_on_a_default_port_is_answered() {
+        for port in [80, 443] {
+            let hosts = allowed_hosts(port, None, &[]);
+            assert!(host_allowed("127.0.0.1", &hosts), "port {port} omitted");
+            assert!(host_allowed(&format!("127.0.0.1:{port}"), &hosts));
+            assert!(host_allowed(&format!("localhost:{port}"), &hosts));
+            assert!(!host_allowed("127.0.0.1:4174", &hosts));
+        }
+    }
+
+    #[test]
+    fn a_non_default_port_is_never_stripped() {
+        let hosts = allowed_hosts(4443, None, &[]);
+        assert!(host_allowed("127.0.0.1:4443", &hosts));
+        assert!(!host_allowed("127.0.0.1:443", &hosts));
+        assert!(!host_allowed("127.0.0.1", &hosts));
+    }
+
+    #[test]
+    fn pending_authentications_have_their_own_cap() {
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guards = (0..MAX_PENDING)
+            .map(|_| ConnectionGuard::acquire(&pending, MAX_PENDING).unwrap())
+            .collect::<Vec<_>>();
+        assert!(ConnectionGuard::acquire(&pending, MAX_PENDING).is_none());
+        drop(guards);
+        assert!(ConnectionGuard::acquire(&pending, MAX_PENDING).is_some());
     }
 
     #[test]
