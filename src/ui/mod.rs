@@ -1437,8 +1437,18 @@ fn draw_commander(
             );
         }
     }
+    // An armed confirmation prompt (kept in `receipt`) always owns this line.
+    // Otherwise results that finished while a prompt was showing come first,
+    // so they are seen even when an older message is still in `receipt`.
+    let held = if commander.confirming() {
+        None
+    } else {
+        commander.held_summary()
+    };
     let footer = if let Some(result) = commander.delivery_results.get(commander.delivery_index) {
         result
+    } else if let Some(held) = held.as_deref() {
+        held
     } else if let Some(receipt) = commander.receipt.as_deref() {
         receipt
     } else if commander.guided_orch.is_some() {

@@ -190,6 +190,11 @@ impl App {
         }
         if key.code == KeyCode::Esc {
             let commander = self.commander.as_mut().unwrap();
+            if commander.confirming() {
+                // The receipt holds the prompt, which would otherwise keep
+                // saying "Enter again" after Enter no longer confirms anything.
+                commander.receipt = None;
+            }
             commander.pending_working_confirmation = None;
             commander.pending_module_confirmation = None;
             commander.focused = false;

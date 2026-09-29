@@ -2635,18 +2635,27 @@ fn clicking_another_tab_works_while_the_strip_stays_open() {
     assert_eq!(app.commander.as_ref().unwrap().draft, draft);
 }
 
-/// A completion arriving while the user is confirming a different module command
-/// must not hide that confirmation's prompt. The prompt stays first on the
-/// receipt line, the confirmation stays armed, and the result is still shown.
+/// Draws the app and returns the whole screen as text.
 #[cfg(unix)]
-#[test]
-fn module_completion_keeps_a_pending_confirmation_prompt_visible() {
-    let _env = crate::persist::test_env("commander-module-confirm-receipt");
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = App::new(80, 24, tx).unwrap();
+fn screen_text(app: &mut App) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+    term.draw(|f| crate::ui::render(f, app)).unwrap();
+    term.backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+/// Starts action A, then arms a confirmation for B while A is still running.
+/// Returns A's log id and B's confirmation prompt.
+#[cfg(unix)]
+fn run_a_then_arm_b(app: &mut App) -> (u64, String) {
     let pane = app.layout().focus;
     add_commander_test_module(
-        &mut app,
+        app,
         "example",
         "review",
         "pane",
@@ -2655,8 +2664,6 @@ fn module_completion_keeps_a_pending_confirmation_prompt_visible() {
         &["sh", "-c", "cat"],
     );
     app.open_commander();
-
-    // Start action A: the first Enter asks, the second one runs it.
     app.commander.as_mut().unwrap().clear_all();
     app.commander
         .as_mut()
@@ -2667,7 +2674,6 @@ fn module_completion_keeps_a_pending_confirmation_prompt_visible() {
     assert_eq!(app.module_logs.len(), 1, "action A started");
     let first = app.module_logs[0].id;
 
-    // While A is still running, begin a second command and reach its prompt.
     app.commander.as_mut().unwrap().clear_all();
     app.commander
         .as_mut()
@@ -2675,28 +2681,140 @@ fn module_completion_keeps_a_pending_confirmation_prompt_visible() {
         .insert(&format!("$review @p{} second", pane.0));
     app.commander_prepare();
     let commander = app.commander.as_ref().unwrap();
-    assert!(
-        commander.pending_module_confirmation.is_some(),
-        "B awaits Enter"
-    );
-    let prompt = commander.receipt.clone().expect("B shows its prompt");
+    assert!(commander.confirming(), "B awaits Enter");
+    (
+        first,
+        commander.receipt.clone().expect("B shows its prompt"),
+    )
+}
 
-    // A finishes now.
+/// While B's confirmation is armed, A's result must not touch B's prompt: the
+/// prompt is drawn whole and alone, and the result is held rather than
+/// appended where a long prompt would push it off the one-line footer.
+#[cfg(unix)]
+#[test]
+fn module_completion_never_shares_the_footer_with_an_armed_prompt() {
+    let _env = crate::persist::test_env("commander-held-armed");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let (first, prompt) = run_a_then_arm_b(&mut app);
+
     app.module_command_finished(first, Some(0), String::new(), String::new());
 
     let commander = app.commander.as_ref().unwrap();
-    let receipt = commander.receipt.as_deref().unwrap();
+    assert!(commander.confirming(), "B is still armed");
+    assert_eq!(commander.receipt.as_deref(), Some(prompt.as_str()));
+    let screen = screen_text(&mut app);
+    assert!(screen.contains("Enter again"), "the prompt is drawn");
     assert!(
-        commander.pending_module_confirmation.is_some(),
-        "B is still armed"
-    );
-    assert!(
-        receipt.starts_with(&prompt),
-        "an armed confirmation lost its prompt: {receipt:?}"
-    );
-    assert!(
-        receipt.contains("succeeded"),
-        "A's result is shown: {receipt:?}"
+        !screen.contains("succeeded"),
+        "A's result stays off the prompt"
     );
     assert_eq!(app.module_logs.len(), 1, "B has not run");
+}
+
+/// Editing the draft dismisses B's prompt, and A's held result is drawn.
+#[cfg(unix)]
+#[test]
+fn held_module_result_is_shown_once_an_edit_dismisses_the_prompt() {
+    let _env = crate::persist::test_env("commander-held-edit");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let (first, _) = run_a_then_arm_b(&mut app);
+    app.module_command_finished(first, Some(0), String::new(), String::new());
+
+    app.commander.as_mut().unwrap().insert("!");
+
+    assert!(!app.commander.as_ref().unwrap().confirming());
+    let screen = screen_text(&mut app);
+    assert!(
+        screen.contains("$example/review succeeded"),
+        "A's result shown"
+    );
+    assert!(!screen.contains("Enter again"), "no stale prompt");
+}
+
+/// Confirming B starts it and still reports A's result alongside the start.
+#[cfg(unix)]
+#[test]
+fn held_module_result_is_reported_when_the_confirmed_action_starts() {
+    let _env = crate::persist::test_env("commander-held-enter");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let (first, _) = run_a_then_arm_b(&mut app);
+    app.module_command_finished(first, Some(0), String::new(), String::new());
+
+    app.commander_prepare();
+
+    assert_eq!(app.module_logs.len(), 2, "B ran");
+    let receipt = app.commander.as_ref().unwrap().receipt.clone().unwrap();
+    assert!(receipt.contains("started"), "{receipt:?}");
+    assert!(receipt.contains("succeeded"), "{receipt:?}");
+}
+
+/// Esc cancels B: its prompt goes away with it and A's result is shown.
+#[cfg(unix)]
+#[test]
+fn escape_dismisses_the_prompt_and_shows_the_held_result() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _env = crate::persist::test_env("commander-held-esc");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let (first, _) = run_a_then_arm_b(&mut app);
+    app.module_command_finished(first, Some(0), String::new(), String::new());
+
+    app.commander_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(!app.commander.as_ref().unwrap().confirming());
+    let screen = screen_text(&mut app);
+    assert!(
+        !screen.contains("Enter again"),
+        "the cancelled prompt is gone"
+    );
+    assert!(
+        screen.contains("$example/review succeeded"),
+        "A's result shown"
+    );
+}
+
+/// Starting B while A is still running must not forget A.
+#[cfg(unix)]
+#[test]
+fn an_earlier_running_action_still_reports_after_another_starts() {
+    let _env = crate::persist::test_env("commander-overlap");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let (first, _) = run_a_then_arm_b(&mut app);
+
+    app.commander_prepare();
+    assert_eq!(app.module_logs.len(), 2, "B started while A still runs");
+
+    app.module_command_finished(first, Some(1), String::new(), "boom".into());
+
+    let receipt = app.commander.as_ref().unwrap().receipt.clone().unwrap();
+    assert!(
+        receipt.contains("failed"),
+        "A's result was dropped: {receipt:?}"
+    );
+    assert!(receipt.contains("boom"), "{receipt:?}");
+}
+
+/// Esc cancels a confirmation with nothing held: the prompt must still go, since
+/// it would otherwise keep offering an Enter that no longer confirms anything.
+#[cfg(unix)]
+#[test]
+fn escape_removes_a_cancelled_confirmation_prompt() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _env = crate::persist::test_env("commander-esc-prompt");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(160, 30, tx).unwrap();
+    let _ = run_a_then_arm_b(&mut app);
+    assert!(
+        screen_text(&mut app).contains("Enter again"),
+        "armed prompt drawn"
+    );
+
+    app.commander_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(!screen_text(&mut app).contains("Enter again"));
 }

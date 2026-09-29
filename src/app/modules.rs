@@ -772,28 +772,31 @@ impl App {
             log.err = err;
         }
         if let Some(commander) = self.commander.as_mut() {
-            if let Some((running, label)) = commander.running_module.as_ref() {
-                if *running == log_id {
-                    let outcome = if succeeded { "succeeded" } else { "failed" };
-                    let completion = format!(
-                        "{label} {outcome} · log {log_id}{}",
-                        if detail.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {detail}")
-                        }
-                    );
-                    // An armed confirmation owns the receipt line: its prompt is
-                    // the only thing telling the user that Enter will act. Keep
-                    // that prompt first and append this result, so neither is
-                    // lost and Enter never fires behind a hidden prompt.
-                    let confirming = commander.pending_module_confirmation.is_some()
-                        || commander.pending_working_confirmation.is_some();
-                    commander.receipt = match commander.receipt.take() {
-                        Some(prompt) if confirming => Some(format!("{prompt} · {completion}")),
-                        _ => Some(completion),
-                    };
-                    commander.running_module = None;
+            let running = commander
+                .running_modules
+                .iter()
+                .position(|(running, _)| *running == log_id);
+            if let Some(index) = running {
+                let (_, label) = commander.running_modules.remove(index);
+                let outcome = if succeeded { "succeeded" } else { "failed" };
+                let completion = format!(
+                    "{label} {outcome} · log {log_id}{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {detail}")
+                    }
+                );
+                if commander.confirming() {
+                    // The prompt is the only thing telling the user that Enter
+                    // will act, so it keeps the footer to itself. The result is
+                    // held and shown as soon as the prompt is gone.
+                    commander.hold_receipt(completion);
+                } else {
+                    commander.receipt = Some(match commander.take_held() {
+                        Some(held) => format!("{held} · {completion}"),
+                        None => completion,
+                    });
                 }
             }
         }

@@ -461,9 +461,16 @@ impl App {
             Ok(Some((log_id, invocation))) => {
                 let label = format!("${}/{}", invocation.spec.module_id, invocation.spec.name);
                 let commander = self.commander.as_mut().unwrap();
+                // Taken before clear_all so an earlier result held under this
+                // confirmation is shown with the new start, not dropped.
+                let held = commander.take_held();
                 commander.clear_all();
-                commander.running_module = Some((log_id, label.clone()));
-                commander.receipt = Some(format!("{label} started · log {log_id}"));
+                commander.running_modules.push((log_id, label.clone()));
+                let started = format!("{label} started · log {log_id}");
+                commander.receipt = Some(match held {
+                    Some(held) => format!("{started} · {held}"),
+                    None => started,
+                });
             }
             Ok(None) => {}
             Err(error) => {
