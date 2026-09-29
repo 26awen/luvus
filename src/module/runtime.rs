@@ -664,11 +664,23 @@ mod tests {
     #[cfg(unix)]
     static LINGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// POSIX shells to run these tests under. `/bin/sh` is bash on macOS but
+    /// dash on Debian-based CI, and the two differ in how a background job
+    /// inherits stdin, so dash is exercised too wherever it is installed.
+    #[cfg(unix)]
+    fn test_shells() -> Vec<&'static str> {
+        ["/bin/sh", "/bin/dash"]
+            .into_iter()
+            .filter(|shell| std::path::Path::new(shell).exists())
+            .collect()
+    }
+
     /// Run `script` (which must write its background PID to `$BG_PID_FILE`)
     /// with `input` on stdin, then return the result, the background PID, and
     /// the lingering count observed right after the run completed.
     #[cfg(unix)]
     fn run_with_background(
+        shell: &str,
         name: &str,
         script: &str,
         input: Vec<u8>,
@@ -680,7 +692,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = run_with_input(
             &dir,
-            &["/bin/sh".into(), "-c".into(), script.into()],
+            &[shell.into(), "-c".into(), script.into()],
             &[("BG_PID_FILE".into(), pid_file.display().to_string())],
             Some(input),
             None,
@@ -725,26 +737,35 @@ mod tests {
     #[test]
     fn async_action_completes_when_a_descendant_keeps_output_open() {
         let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let baseline = lingering_actions();
-        let ((code, out, err), bg, lingering, elapsed) = run_with_background(
-            "drain",
-            "sleep 30 & echo $! > \"$BG_PID_FILE\"; printf ready",
-            br#"{"version":1}"#.to_vec(),
-            true,
-        );
-        let still_running = unsafe { libc::kill(bg, 0) } == 0;
-        stop_and_drain(bg, baseline);
+        for shell in test_shells() {
+            let baseline = lingering_actions();
+            let ((code, out, err), bg, lingering, elapsed) = run_with_background(
+                shell,
+                "drain",
+                "sleep 30 & echo $! > \"$BG_PID_FILE\"; printf ready",
+                br#"{"version":1}"#.to_vec(),
+                true,
+            );
+            let still_running = unsafe { libc::kill(bg, 0) } == 0;
+            stop_and_drain(bg, baseline);
 
-        assert!(elapsed < Duration::from_secs(10), "blocked for {elapsed:?}");
-        assert_eq!(code, Some(0), "the action itself succeeded: {err:?}");
-        assert_eq!(out, "ready");
-        assert!(err.contains("background process kept"), "{err:?}");
-        assert!(
-            still_running,
-            "a deliberately backgrounded process was killed"
-        );
-        assert_eq!(lingering, baseline + 1, "attached readers hold a slot");
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "{shell}: blocked {elapsed:?}"
+            );
+            assert_eq!(code, Some(0), "{shell}: the action succeeded: {err:?}");
+            assert_eq!(out, "ready", "{shell}");
+            assert!(err.contains("background process kept"), "{shell}: {err:?}");
+            assert!(still_running, "{shell}: a backgrounded process was killed");
+            assert_eq!(lingering, baseline + 1, "{shell}: readers hold a slot");
+        }
     }
+
+    /// Keeps the action's stdin open in a background process that never reads
+    /// it. A plain `&` gives a background job `/dev/null` as stdin, and dash
+    /// applies that before an explicit `<&0`, so stdin is saved to fd 3 first.
+    #[cfg(unix)]
+    const HOLD_STDIN_UNREAD: &str = "exec 3<&0; sleep 30 <&3 & echo $! > \"$BG_PID_FILE\"; exit 0";
 
     /// Input the action never read was not delivered. For an action that reads
     /// its input that is a failure, even though the action exited with 0 and a
@@ -753,20 +774,31 @@ mod tests {
     #[test]
     fn async_action_that_leaves_input_unread_is_not_reported_as_delivered() {
         let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let baseline = lingering_actions();
-        // Larger than any pipe buffer, so the write cannot complete unread. An
-        // explicit `<&0` keeps stdin, which a plain `&` would redirect.
-        let ((code, _out, err), bg, _, elapsed) = run_with_background(
-            "unread-input",
-            "sleep 30 <&0 & echo $! > \"$BG_PID_FILE\"; exit 0",
-            vec![b'x'; 1 << 20],
-            false,
-        );
-        stop_and_drain(bg, baseline);
+        for shell in test_shells() {
+            let baseline = lingering_actions();
+            // Larger than any pipe buffer, so the write cannot complete unread.
+            let ((code, _out, err), bg, _, elapsed) = run_with_background(
+                shell,
+                "unread-input",
+                HOLD_STDIN_UNREAD,
+                vec![b'x'; 1 << 20],
+                false,
+            );
+            stop_and_drain(bg, baseline);
 
-        assert!(elapsed < Duration::from_secs(10), "blocked for {elapsed:?}");
-        assert_eq!(code, None, "undelivered input reported success: {err:?}");
-        assert!(err.contains("before reading all of its input"), "{err:?}");
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "{shell}: blocked {elapsed:?}"
+            );
+            assert_eq!(
+                code, None,
+                "{shell}: unread input reported success: {err:?}"
+            );
+            assert!(
+                err.contains("before reading all of its input"),
+                "{shell}: {err:?}"
+            );
+        }
     }
 
     /// The same unread input is fine for an action that declared it takes no
@@ -775,17 +807,20 @@ mod tests {
     #[test]
     fn async_action_without_input_may_leave_stdin_unread() {
         let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let baseline = lingering_actions();
-        let ((code, _out, err), bg, _, _) = run_with_background(
-            "unread-none",
-            "sleep 30 <&0 & echo $! > \"$BG_PID_FILE\"; exit 0",
-            vec![b'x'; 1 << 20],
-            true,
-        );
-        stop_and_drain(bg, baseline);
+        for shell in test_shells() {
+            let baseline = lingering_actions();
+            let ((code, _out, err), bg, _, _) = run_with_background(
+                shell,
+                "unread-none",
+                HOLD_STDIN_UNREAD,
+                vec![b'x'; 1 << 20],
+                true,
+            );
+            stop_and_drain(bg, baseline);
 
-        assert_eq!(code, Some(0), "{err:?}");
-        assert!(!err.contains("before reading all"), "{err:?}");
+            assert_eq!(code, Some(0), "{shell}: {err:?}");
+            assert!(!err.contains("before reading all"), "{shell}: {err:?}");
+        }
     }
 
     #[cfg(unix)]
