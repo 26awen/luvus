@@ -1510,7 +1510,7 @@ impl App {
             .is_some_and(|grab| !self.panes.contains_key(&grab.pane))
         {
             if let Some(grab) = self.mouse_grab.take() {
-                self.suppressed_mouse_releases |= mouse_button_bit(grab.button);
+                self.suppressed_mouse_buttons |= mouse_button_bit(grab.button);
             }
         }
         // A forwarded gesture owns the pointer until its button comes up, like
@@ -1534,13 +1534,13 @@ impl App {
                         self.mouse_grab = None;
                         self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
                     } else {
-                        self.suppressed_mouse_releases &= !mouse_button_bit(button);
+                        self.suppressed_mouse_buttons &= !mouse_button_bit(button);
                     }
                     return true;
                 }
                 MouseEventKind::Down(button) => {
                     if button != g.button {
-                        self.suppressed_mouse_releases |= mouse_button_bit(button);
+                        self.suppressed_mouse_buttons |= mouse_button_bit(button);
                     }
                     return true;
                 }
@@ -1549,16 +1549,21 @@ impl App {
         }
         match kind {
             MouseEventKind::Up(button)
-                if self.suppressed_mouse_releases & mouse_button_bit(button) != 0 =>
+                if self.suppressed_mouse_buttons & mouse_button_bit(button) != 0 =>
             {
-                self.suppressed_mouse_releases &= !mouse_button_bit(button);
+                self.suppressed_mouse_buttons &= !mouse_button_bit(button);
+                return true;
+            }
+            MouseEventKind::Drag(button)
+                if self.suppressed_mouse_buttons & mouse_button_bit(button) != 0 =>
+            {
                 return true;
             }
             // A new press starts a new physical gesture. If the terminal never
             // delivered an older matching release, do not let that stale state
             // swallow the new gesture's eventual release.
             MouseEventKind::Down(button) => {
-                self.suppressed_mouse_releases &= !mouse_button_bit(button);
+                self.suppressed_mouse_buttons &= !mouse_button_bit(button);
             }
             _ => {}
         }
@@ -10891,12 +10896,12 @@ mod link_click_tests {
         assert_eq!(after.dragging, before.dragging);
         assert!(app.pending_clipboard.is_none());
         assert!(app.mouse_grab.is_none());
-        assert_eq!(app.suppressed_mouse_releases, 0);
+        assert_eq!(app.suppressed_mouse_buttons, 0);
     }
 
-    /// Closing a pane cannot leave its forwarded pointer grab capturing later
-    /// input. The orphaned release is swallowed, then a fresh click reaches the
-    /// surviving pane normally.
+    /// Closing a pane cannot let the remainder of its forwarded gesture mutate
+    /// another pane. Its orphaned drag and release are swallowed, then a fresh
+    /// click reaches the surviving pane normally.
     #[test]
     fn closing_the_grabbed_pane_does_not_capture_later_clicks() {
         let _env = crate::persist::test_env("grab-closed-pane");
@@ -10916,7 +10921,7 @@ mod link_click_tests {
         enable_mouse_tracking(&app, survivor);
 
         app.handle_event(mouse(
-            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Left),
             off_link,
             KeyModifiers::NONE,
         ));
@@ -10932,14 +10937,35 @@ mod link_click_tests {
             .map(|(_, rect)| *rect)
             .expect("survivor content rect");
         let inside = (survivor_content.x + 1, survivor_content.y);
+        app.selection = Some(crate::app::Selection {
+            pane: survivor,
+            content: survivor_content,
+            anchor: inside,
+            cursor: inside,
+            retained: None,
+            scrolled: false,
+            dragging: false,
+        });
 
         app.handle_event(mouse(
-            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Left),
+            (inside.0 + 5, inside.1),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.selection.map(|selection| selection.cursor),
+            Some(inside),
+            "the orphaned drag cannot move the surviving pane's selection"
+        );
+        assert!(app.pending_clipboard.is_none());
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
             inside,
             KeyModifiers::NONE,
         ));
         assert!(app.mouse_grab.is_none());
-        assert_eq!(app.suppressed_mouse_releases, 0);
+        assert_eq!(app.suppressed_mouse_buttons, 0);
 
         app.handle_event(mouse(
             MouseEventKind::Down(MouseButton::Left),
