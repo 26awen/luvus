@@ -2448,6 +2448,16 @@ struct PendingPtyExit {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskGateRun {
+    generation: u64,
+    attempt: u32,
+}
+
+struct ActiveTaskGate {
+    run: TaskGateRun,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
 /// A Press forwarded to a pane. Later Repeat/Release phases return to this
 /// pane even after focus moves; client teardown releases it synthetically.
 #[derive(Clone, Copy, Debug)]
@@ -2777,6 +2787,12 @@ pub struct App {
     /// Multi-agent orchestration ledger + path leases (docs/22, ORCH-1/2). Kept
     /// in its own file (`orch.json`), independent of the session snapshot.
     pub orch: crate::orch::OrchState,
+    /// The exact asynchronous quality-gate run and cancellation handle owned by
+    /// each task. Process-local by design: gate workers do not survive restart.
+    task_gates_inflight: HashMap<String, ActiveTaskGate>,
+    /// Monotonic identity for gate runs within this server process. A late
+    /// result must match this value before it may mutate its task.
+    task_gate_generation: u64,
     /// Durable agent automation definitions and bounded run history. The app
     /// event loop remains their only mutable owner.
     pub automation: crate::automation::AutomationState,
@@ -3508,6 +3524,8 @@ impl App {
             session_dirty: true,
             events: api::new_bus(),
             orch: crate::orch::OrchState::load(),
+            task_gates_inflight: HashMap::new(),
+            task_gate_generation: 0,
             automation: crate::automation::AutomationState::load(),
             orch_scroll: 0,
             orch_view: OrchView::Tasks,
@@ -4228,6 +4246,8 @@ impl App {
             session_dirty: discarded_pane_screens,
             events: api::new_bus(),
             orch: crate::orch::OrchState::load(),
+            task_gates_inflight: HashMap::new(),
+            task_gate_generation: 0,
             automation: crate::automation::AutomationState::load(),
             orch_scroll: 0,
             orch_view: OrchView::Tasks,

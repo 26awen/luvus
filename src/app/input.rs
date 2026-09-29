@@ -710,6 +710,27 @@ impl App {
                 self.apply_named_session_deleted(generation, name, result);
                 return true;
             }
+            // Quality gates belong to the server-owned task ledger rather than
+            // workspace geometry. Always settle the exact run, including while
+            // the server has no workspace after a failed replacement spawn.
+            AppEvent::TaskGateFinished {
+                task,
+                generation,
+                attempt,
+                code,
+                out,
+            } => {
+                self.task_gate_finished(
+                    &task,
+                    crate::app::TaskGateRun {
+                        generation,
+                        attempt,
+                    },
+                    code,
+                    out,
+                );
+                return true;
+            }
             other => other,
         };
         // Control-API requests and parked `wait.output` replies must be answered
@@ -1286,9 +1307,8 @@ impl App {
                 self.git_data(view, payload);
                 true
             }
-            AppEvent::TaskGateFinished { task, code, out } => {
-                self.task_gate_finished(&task, code, out);
-                true
+            AppEvent::TaskGateFinished { .. } => {
+                unreachable!("task gate completions are handled before workspace routing")
             }
             AppEvent::TaskMergeFinished {
                 task,
@@ -7650,6 +7670,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["result"]["outcome"], "merged");
+    }
+
+    #[test]
+    fn gate_completion_settles_without_a_workspace() {
+        let _env = crate::persist::test_env("gate-completion-no-workspace");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        app.orch
+            .add_task("gate".into(), vec![], vec![], Some("true".into()))
+            .unwrap();
+        assert_eq!(app.complete_task("t1"), Ok(true));
+        let run = app.task_gates_inflight["t1"].run;
+        app.workspaces.clear();
+
+        let dirty = app.handle_event(AppEvent::TaskGateFinished {
+            task: "t1".into(),
+            generation: run.generation,
+            attempt: run.attempt,
+            code: Some(0),
+            out: String::new(),
+        });
+
+        assert!(dirty);
+        assert!(!app.task_gates_inflight.contains_key("t1"));
+        assert_eq!(
+            app.orch.task("t1").unwrap().status,
+            crate::orch::TaskStatus::Done
+        );
     }
 
     #[test]
