@@ -7,7 +7,7 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,6 +29,32 @@ pub const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 /// inherit stdout/stderr/stdin; past this grace the run is reported complete
 /// rather than left Running until that descendant happens to exit.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Completed actions whose I/O threads are still attached because a background
+/// descendant holds one of their pipes. They count toward [`MAX_IN_FLIGHT`] so
+/// that leaving such a process running can never accumulate threads and pipe
+/// handles without bound.
+static LINGERING: AtomicUsize = AtomicUsize::new(0);
+
+/// Completed actions still draining a pipe held open by a background process.
+pub fn lingering_actions() -> usize {
+    LINGERING.load(Ordering::Acquire)
+}
+
+/// Shared by one run's stdin writer and output readers. When a completed run is
+/// detached from them, the last of those threads to finish releases its
+/// [`LINGERING`] slot, however long the background process lives.
+struct IoThreads {
+    detached: AtomicBool,
+}
+
+impl Drop for IoThreads {
+    fn drop(&mut self) {
+        if self.detached.load(Ordering::Acquire) {
+            LINGERING.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 pub const MODULE_TOKEN_ENV: &str = "LUVUS_MODULE_TOKEN";
 
 /// Commander always sends its versioned document, even when the action
@@ -307,8 +333,13 @@ fn run_with_input(
     } else {
         None
     };
+    let io_threads = Arc::new(IoThreads {
+        detached: AtomicBool::new(false),
+    });
     let mut stdin = child.stdin.take();
+    let in_group = Arc::clone(&io_threads);
     let t_in = thread::spawn(move || -> std::io::Result<()> {
+        let _group = in_group;
         if let (Some(stdin), Some(input)) = (stdin.as_mut(), input) {
             use std::io::Write;
             stdin.write_all(&input)?;
@@ -328,7 +359,9 @@ fn run_with_input(
     let err_buf = Arc::new(Mutex::new(Vec::new()));
     let t_out = {
         let sink = Arc::clone(&out_buf);
+        let group = Arc::clone(&io_threads);
         thread::spawn(move || {
+            let _group = group;
             if let Some(r) = so.as_mut() {
                 read_capped_into(r, &sink);
             }
@@ -336,7 +369,9 @@ fn run_with_input(
     };
     let t_err = {
         let sink = Arc::clone(&err_buf);
+        let group = Arc::clone(&io_threads);
         thread::spawn(move || {
+            let _group = group;
             if let Some(r) = se.as_mut() {
                 read_capped_into(r, &sink);
             }
@@ -379,13 +414,24 @@ fn run_with_input(
     // may background work deliberately, and the child's real status is kept.
     let output_detached =
         deadline.is_none() && !drained_within(&t_in, &t_out, &t_err, OUTPUT_DRAIN_GRACE);
+    if output_detached {
+        // Held until the last I/O thread ends. This handle is dropped when the
+        // function returns, so the slot cannot be released before it is taken.
+        LINGERING.fetch_add(1, Ordering::AcqRel);
+        io_threads.detached.store(true, Ordering::Release);
+    }
     let input_result = if t_in.is_finished() {
         t_in.join()
             .unwrap_or_else(|_| Err(std::io::Error::other("module stdin writer panicked")))
     } else {
-        // The child exited without draining stdin while a descendant still
-        // holds its read end. That is not a delivery failure of this run.
-        Ok(())
+        // The action exited without reading all of its input, and a background
+        // process still holds the read end. The input was not delivered, which
+        // is the same outcome as a closed pipe, so it follows the same rule:
+        // acceptable only for a successful action that declared no input.
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the action exited before reading all of its input",
+        ))
     };
     if !output_detached {
         let _ = t_out.join();
@@ -413,7 +459,8 @@ fn run_with_input(
         }
         err.push_str(
             "a background process kept this action's output open after it exited; \
-             later output was not captured",
+             later output was not captured, and the action counts toward the \
+             in-flight command limit until that process closes it",
         );
     }
     drop(tree_guard);
@@ -550,7 +597,7 @@ fn drained_within(
 mod tests {
     use super::{complete_env, MODULE_TOKEN_ENV};
     #[cfg(unix)]
-    use super::{run, run_with_input, AtomicBool, Duration, Ordering};
+    use super::{lingering_actions, run, run_with_input, AtomicBool, Duration, Ordering};
 
     #[cfg(unix)]
     #[test]
@@ -611,41 +658,82 @@ mod tests {
         assert!(err.is_empty(), "{err}");
     }
 
-    /// A Commander action that exits while a background descendant still holds
-    /// its stdout must complete promptly with the child's real exit status and
-    /// the output captured so far, and must leave that descendant running.
+    /// Runs that leave I/O threads attached share one global count, so every
+    /// test that creates one holds this lock and waits for its own count to
+    /// drain before releasing it. The baseline each test sees is then exact.
     #[cfg(unix)]
-    #[test]
-    fn async_action_completes_when_a_descendant_keeps_output_open() {
-        let dir =
-            std::env::temp_dir().join(format!("luvus-drain-{}-{}", std::process::id(), line!()));
+    static LINGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `script` (which must write its background PID to `$BG_PID_FILE`)
+    /// with `input` on stdin, then return the result, the background PID, and
+    /// the lingering count observed right after the run completed.
+    #[cfg(unix)]
+    fn run_with_background(
+        name: &str,
+        script: &str,
+        input: Vec<u8>,
+        allow_closed_on_success: bool,
+    ) -> ((Option<i32>, String, String), i32, usize, Duration) {
+        let dir = std::env::temp_dir().join(format!("luvus-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pid_file = dir.join("bg.pid");
-        let script = format!(
-            "sleep 30 & echo $! > '{}'; printf ready",
-            pid_file.display()
-        );
         let started = std::time::Instant::now();
-        let (code, out, err) = run_with_input(
+        let result = run_with_input(
             &dir,
-            &["/bin/sh".into(), "-c".into(), script],
-            &[],
-            Some(br#"{"version":1}"#.to_vec()),
+            &["/bin/sh".into(), "-c".into(), script.into()],
+            &[("BG_PID_FILE".into(), pid_file.display().to_string())],
+            Some(input),
             None,
             None,
-            true,
+            allow_closed_on_success,
         );
         let elapsed = started.elapsed();
+        let lingering = lingering_actions();
         let bg: i32 = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        let still_running = unsafe { libc::kill(bg, 0) } == 0;
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, bg, lingering, elapsed)
+    }
+
+    /// Stop a background process and wait until the lingering count is back
+    /// to `baseline`, proving its I/O threads released their slot.
+    #[cfg(unix)]
+    fn stop_and_drain(bg: i32, baseline: usize) {
         unsafe {
             libc::kill(bg, libc::SIGKILL);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while lingering_actions() != baseline && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            lingering_actions(),
+            baseline,
+            "a finished background process did not release its I/O threads"
+        );
+    }
+
+    /// A Commander action that exits while a background descendant still holds
+    /// its stdout must complete promptly with the child's real exit status and
+    /// the output captured so far, and must leave that descendant running. Its
+    /// still-attached readers hold one in-flight slot until the descendant
+    /// exits, and release it afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn async_action_completes_when_a_descendant_keeps_output_open() {
+        let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let baseline = lingering_actions();
+        let ((code, out, err), bg, lingering, elapsed) = run_with_background(
+            "drain",
+            "sleep 30 & echo $! > \"$BG_PID_FILE\"; printf ready",
+            br#"{"version":1}"#.to_vec(),
+            true,
+        );
+        let still_running = unsafe { libc::kill(bg, 0) } == 0;
+        stop_and_drain(bg, baseline);
 
         assert!(elapsed < Duration::from_secs(10), "blocked for {elapsed:?}");
         assert_eq!(code, Some(0), "the action itself succeeded: {err:?}");
@@ -655,6 +743,49 @@ mod tests {
             still_running,
             "a deliberately backgrounded process was killed"
         );
+        assert_eq!(lingering, baseline + 1, "attached readers hold a slot");
+    }
+
+    /// Input the action never read was not delivered. For an action that reads
+    /// its input that is a failure, even though the action exited with 0 and a
+    /// background process is still holding stdin.
+    #[cfg(unix)]
+    #[test]
+    fn async_action_that_leaves_input_unread_is_not_reported_as_delivered() {
+        let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let baseline = lingering_actions();
+        // Larger than any pipe buffer, so the write cannot complete unread. An
+        // explicit `<&0` keeps stdin, which a plain `&` would redirect.
+        let ((code, _out, err), bg, _, elapsed) = run_with_background(
+            "unread-input",
+            "sleep 30 <&0 & echo $! > \"$BG_PID_FILE\"; exit 0",
+            vec![b'x'; 1 << 20],
+            false,
+        );
+        stop_and_drain(bg, baseline);
+
+        assert!(elapsed < Duration::from_secs(10), "blocked for {elapsed:?}");
+        assert_eq!(code, None, "undelivered input reported success: {err:?}");
+        assert!(err.contains("before reading all of its input"), "{err:?}");
+    }
+
+    /// The same unread input is fine for an action that declared it takes no
+    /// input, matching how a closed stdin is already treated.
+    #[cfg(unix)]
+    #[test]
+    fn async_action_without_input_may_leave_stdin_unread() {
+        let _lock = LINGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let baseline = lingering_actions();
+        let ((code, _out, err), bg, _, _) = run_with_background(
+            "unread-none",
+            "sleep 30 <&0 & echo $! > \"$BG_PID_FILE\"; exit 0",
+            vec![b'x'; 1 << 20],
+            true,
+        );
+        stop_and_drain(bg, baseline);
+
+        assert_eq!(code, Some(0), "{err:?}");
+        assert!(!err.contains("before reading all"), "{err:?}");
     }
 
     #[cfg(unix)]

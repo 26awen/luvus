@@ -680,9 +680,16 @@ For pipes or `$VAR`, invoke a shell explicitly:
 A process your action starts in the background keeps running after the action
 exits. If it inherited stdout or stderr, luvus waits about 2 seconds for those
 streams to close, then records the action's own exit status with the output
-captured so far and a note that later output was not captured. Redirect a
-background process's output (for example `server >server.log 2>&1 &`) when you
-want the action to finish immediately.
+captured so far and a note that later output was not captured. Until that
+process closes the streams, the action still counts toward the 32-command
+in-flight limit. Redirect a background process's output (for example
+`server >server.log 2>&1 &`) when you want the action to finish immediately and
+free its slot.
+
+Commander input that your action exits without reading was not delivered. For
+an action that reads input, that makes the run fail even if it exited with 0.
+An action whose `commander` table sets `input = "none"` may leave its input
+unread.
 
 Caps: at most **32** module commands in flight, and the **200** most recent log
 entries are kept. Commands are isolated processes, so a crash or hang never

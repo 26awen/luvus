@@ -680,16 +680,28 @@ impl App {
                     .unwrap_or_else(|| format!("module {module_id} is disabled")));
             }
         }
+        // Completed actions whose output a background process still holds keep
+        // their I/O threads, so they share the same bound as running ones.
+        let lingering = runtime::lingering_actions();
         let in_flight = self
             .module_logs
             .iter()
             .filter(|l| l.status == ModuleStatus::Running)
-            .count();
+            .count()
+            + lingering;
         if in_flight >= runtime::MAX_IN_FLIGHT {
-            return Err(format!(
-                "too many module commands in flight (max {})",
-                runtime::MAX_IN_FLIGHT
-            ));
+            return Err(if lingering > 0 {
+                format!(
+                    "too many module commands in flight (max {}, including {lingering} \
+                     whose background process still holds its output)",
+                    runtime::MAX_IN_FLIGHT
+                )
+            } else {
+                format!(
+                    "too many module commands in flight (max {})",
+                    runtime::MAX_IN_FLIGHT
+                )
+            });
         }
         let ctx = context::build_for(self, source, &target);
         let (root, env) = {
