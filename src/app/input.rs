@@ -1171,40 +1171,38 @@ impl App {
                     && rows
                         .iter()
                         .all(|row| row.usage.as_ref().and_then(|usage| usage.cost).is_some());
-                let keys = self
+                let usage = self
                     .mission_usage_targets_for(request.scope, workspace)
                     .into_keys()
-                    .filter(|key| {
-                        self.agent_usage
-                            .get(key)
-                            .and_then(|usage| usage.cost)
-                            .is_some()
+                    .filter_map(|key| {
+                        let entry = self.agent_usage.get(&key)?;
+                        Some((
+                            key,
+                            crate::mission::MissionBurnPoint {
+                                model: entry.model.clone(),
+                                tokens_in: entry.tokens_in,
+                                tokens_out: entry.tokens_out,
+                                cache: entry.cache,
+                                cost: entry.cost?,
+                            },
+                        ))
                     })
-                    .collect::<HashSet<_>>();
-                let total: f64 = keys
-                    .iter()
-                    .filter_map(|key| self.agent_usage.get(key).and_then(|usage| usage.cost))
-                    .sum();
+                    .collect::<HashMap<_, _>>();
+                let total: f64 = usage.values().map(|entry| entry.cost).sum();
                 let now = std::time::Instant::now();
-                self.mission_burn = self.mission_last_cost.as_ref().and_then(|previous| {
-                    let same_scope = previous.scope == request.scope
-                        && (request.scope == crate::mission::MissionScope::All
-                            || previous.workspace_id == request.workspace_id);
-                    let dt = now.duration_since(previous.at).as_secs_f64();
-                    (complete
-                        && same_scope
-                        && previous.keys == keys
-                        && dt > 1.0
-                        && total >= previous.total)
-                        .then_some((total - previous.total) / dt * 3600.0)
-                });
-                self.mission_last_cost = complete.then_some(crate::mission::MissionBurnSample {
+                let sample = complete.then_some(crate::mission::MissionBurnSample {
                     scope: request.scope,
                     workspace_id: request.workspace_id,
-                    keys,
+                    usage,
                     total,
                     at: now,
                 });
+                self.mission_burn = self
+                    .mission_last_cost
+                    .as_ref()
+                    .zip(sample.as_ref())
+                    .and_then(|(previous, current)| previous.rate_to(current));
+                self.mission_last_cost = sample;
                 self.active_is_mission()
             }
             AppEvent::FileFilterResults {

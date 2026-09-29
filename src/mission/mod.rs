@@ -44,9 +44,51 @@ pub(crate) const MAX_PENDING_USAGE_REFRESHES: usize = 64;
 pub(crate) struct MissionBurnSample {
     pub scope: MissionScope,
     pub workspace_id: Option<String>,
-    pub keys: std::collections::HashSet<UsageKey>,
+    pub usage: std::collections::HashMap<UsageKey, MissionBurnPoint>,
     pub total: f64,
     pub at: std::time::Instant,
+}
+
+/// Counters needed to distinguish new usage from a cost-only correction.
+pub(crate) struct MissionBurnPoint {
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache: u64,
+    pub cost: f64,
+}
+
+impl MissionBurnSample {
+    pub fn rate_to(&self, next: &Self) -> Option<f64> {
+        if self.scope != next.scope
+            || (self.scope == MissionScope::Workspace && self.workspace_id != next.workspace_id)
+            || self.usage.len() != next.usage.len()
+        {
+            return None;
+        }
+        let elapsed = next.at.duration_since(self.at).as_secs_f64();
+        if elapsed <= 1.0 || next.total < self.total {
+            return None;
+        }
+        for (key, current) in &next.usage {
+            let previous = self.usage.get(key)?;
+            if current.model != previous.model
+                || current.tokens_in < previous.tokens_in
+                || current.tokens_out < previous.tokens_out
+                || current.cache < previous.cache
+                || current.cost < previous.cost
+            {
+                return None;
+            }
+            let tokens_advanced = current.tokens_in > previous.tokens_in
+                || current.tokens_out > previous.tokens_out
+                || current.cache > previous.cache;
+            if current.cost > previous.cost && !tokens_advanced {
+                return None;
+            }
+        }
+        Some((next.total - self.total) / elapsed * 3600.0)
+    }
 }
 
 /// Stable cache identity for a native usage ledger. Session identifiers are

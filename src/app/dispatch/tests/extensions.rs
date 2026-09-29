@@ -230,6 +230,124 @@ fn mission_refresh_preserves_distinct_pending_scopes() {
 }
 
 #[test]
+fn mission_refresh_workers_complete_queued_scopes() {
+    let _env = crate::persist::test_env("mission-refresh-queued-workers");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = App::new(100, 30, tx).unwrap();
+    app.dispatch("mission.refresh", &json!({})).unwrap();
+    app.dispatch("mission.refresh", &json!({"scope":"all"}))
+        .unwrap();
+
+    let wait_for_scan = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = rx
+                .recv_timeout(remaining)
+                .expect("queued usage worker must finish");
+            if matches!(&event, crate::event::AppEvent::UsageScanned { .. }) {
+                break event;
+            }
+        }
+    };
+
+    app.detect_tick_with(std::time::Instant::now(), false);
+    let first = wait_for_scan();
+    assert!(matches!(
+        &first,
+        crate::event::AppEvent::UsageScanned { request, .. } if request.id == 1
+    ));
+    app.handle_event(first);
+    assert_eq!(app.mission_usage_completed_id, 1);
+
+    app.detect_tick_with(std::time::Instant::now(), false);
+    let second = wait_for_scan();
+    assert!(matches!(
+        &second,
+        crate::event::AppEvent::UsageScanned { request, .. } if request.id == 2
+    ));
+    app.handle_event(second);
+    let snapshot = app
+        .dispatch("mission.snapshot", &json!({"scope":"all"}))
+        .unwrap();
+    assert_eq!(snapshot["refresh"]["completed_id"], "2");
+    assert_eq!(snapshot["refreshing"], false);
+}
+
+#[test]
+fn mission_burn_ignores_cost_only_corrections_with_other_usage() {
+    let _env = crate::persist::test_env("mission-burn-correction");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(100, 30, tx).unwrap();
+    let pane = app.layout().focus;
+    app.status.get_mut(&pane).unwrap().agent = "claude".into();
+    app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
+        agent: "claude".into(),
+        session_id: "reported-usage".into(),
+    });
+    let reported = crate::mission::UsageKey::new("claude", "reported-usage");
+    app.reported_usage.insert(
+        reported.clone(),
+        crate::mission::ReportedUsage {
+            pane,
+            updated_at: 1,
+        },
+    );
+    app.agent_usage.insert(
+        reported.clone(),
+        crate::mission::AgentUsage {
+            model: "reported-model".into(),
+            tokens_in: 100,
+            cost: Some(1.0),
+            ..Default::default()
+        },
+    );
+    app.resumable.push(crate::agent::SessionInfo {
+        agent: "codex".into(),
+        session_id: "native-usage".into(),
+        cwd: app.ws().cwd.clone(),
+        updated: std::time::SystemTime::now(),
+    });
+    let native = crate::mission::UsageKey::new("codex", "native-usage");
+    let mut native_usage = crate::mission::AgentUsage {
+        model: "native-model".into(),
+        tokens_in: 100,
+        cost: Some(1.0),
+        ..Default::default()
+    };
+    let scanned = |native_usage| crate::event::AppEvent::UsageScanned {
+        request: crate::mission::MissionUsageRequest {
+            id: 0,
+            scope: crate::mission::MissionScope::All,
+            workspace: 0,
+            workspace_id: None,
+        },
+        scanned: vec![reported.clone(), native.clone()],
+        usage: [(native.clone(), native_usage)].into(),
+        mtimes: Default::default(),
+        report_owned: vec![reported.clone()],
+    };
+
+    app.handle_event(scanned(native_usage.clone()));
+    assert!(app.mission_last_cost.is_some());
+    app.mission_last_cost.as_mut().unwrap().at -= std::time::Duration::from_secs(2);
+
+    // The integration reprices one unchanged session while another session
+    // genuinely spends more. The correction must not inflate the fleet rate.
+    app.agent_usage.get_mut(&reported).unwrap().cost = Some(2.0);
+    native_usage.tokens_in += 10;
+    native_usage.cost = Some(1.1);
+    app.handle_event(scanned(native_usage.clone()));
+    assert!(app.mission_burn.is_none());
+    app.mission_last_cost.as_mut().unwrap().at -= std::time::Duration::from_secs(2);
+
+    native_usage.tokens_in += 10;
+    native_usage.cost = Some(1.2);
+    app.handle_event(scanned(native_usage));
+    assert!(app.mission_burn.is_some_and(|rate| rate > 0.0));
+}
+
+#[test]
 fn theme_api_lists_validates_and_applies_registry_entries() {
     let _env = crate::persist::test_env("theme-api");
     let source = crate::persist::ensure_config_dir().join("api-theme.toml");
