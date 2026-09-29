@@ -2851,8 +2851,8 @@ pub struct App {
     /// Fleet burn rate in USD/hour (docs/54), from the change in total cost between
     /// usage scans; `None` until two scans have landed.
     pub mission_burn: Option<f64>,
-    /// Previous (total cost, time) sample, for the burn-rate delta.
-    pub mission_last_cost: Option<(f64, std::time::Instant)>,
+    /// Previous comparable cost sample, for the burn-rate delta.
+    pub mission_last_cost: Option<crate::mission::MissionBurnSample>,
     /// Best-effort usage (tokens/context/cost) keyed by **agent + session id**, so
     /// a live pane and its resumable on-disk session share one entry without
     /// colliding with another agent's local session namespace. Refreshed
@@ -2860,6 +2860,8 @@ pub struct App {
     /// path (docs/54 MC-2/MC-4).
     pub agent_usage:
         std::collections::HashMap<crate::mission::UsageKey, crate::mission::AgentUsage>,
+    /// Native sessions that have completed at least one usage read attempt.
+    mission_usage_attempted: HashSet<crate::mission::UsageKey>,
     /// Entries whose exact session and counters came from a live integration.
     /// Kept separately from native mtimes so a background native-store refresh
     /// cannot erase or overwrite the stronger pane-local authority.
@@ -3025,10 +3027,14 @@ pub struct App {
     /// changing its scope, or choosing refresh queues one off-loop scan. No
     /// usage reader runs merely because a hidden Mission Control tab exists.
     mission_usage_requested: Option<crate::mission::MissionUsageRequest>,
+    mission_usage_queued: std::collections::VecDeque<crate::mission::MissionUsageRequest>,
+    mission_usage_inflight: Option<crate::mission::MissionUsageRequest>,
+    mission_usage_next_id: u64,
+    mission_usage_completed_id: u64,
+    mission_usage_completed_at: Option<u64>,
     /// Workspace whose Mission Control tab was visible on the previous sync.
     /// `None` also records transitions away from Mission Control.
     mission_active_workspace: Option<usize>,
-    usage_scan_inflight: bool,
     /// Throttle for per-pane agent classification — it locks each pane's VT engine
     /// and scans its grid, so it runs at ~100ms, not at the render frame rate.
     last_detect_at: Instant,
@@ -3556,6 +3562,7 @@ impl App {
             mission_burn: None,
             mission_last_cost: None,
             agent_usage: std::collections::HashMap::new(),
+            mission_usage_attempted: HashSet::new(),
             reported_usage: std::collections::HashMap::new(),
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
@@ -3609,8 +3616,12 @@ impl App {
             dismissed_sessions: HashSet::new(),
             last_sessions_at: Instant::now(),
             mission_usage_requested: None,
+            mission_usage_queued: std::collections::VecDeque::new(),
+            mission_usage_inflight: None,
+            mission_usage_next_id: 1,
+            mission_usage_completed_id: 0,
+            mission_usage_completed_at: None,
             mission_active_workspace: None,
-            usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             runtime_cwd_dirty: false,
             runtime_cwd_dirty_panes: HashSet::new(),
@@ -4278,6 +4289,7 @@ impl App {
             mission_burn: None,
             mission_last_cost: None,
             agent_usage: std::collections::HashMap::new(),
+            mission_usage_attempted: HashSet::new(),
             reported_usage: std::collections::HashMap::new(),
             usage_mtimes: std::collections::HashMap::new(),
             last_cursor: None,
@@ -4331,8 +4343,12 @@ impl App {
             dismissed_sessions: HashSet::new(),
             last_sessions_at: Instant::now(),
             mission_usage_requested: None,
+            mission_usage_queued: std::collections::VecDeque::new(),
+            mission_usage_inflight: None,
+            mission_usage_next_id: 1,
+            mission_usage_completed_id: 0,
+            mission_usage_completed_at: None,
             mission_active_workspace: None,
-            usage_scan_inflight: false,
             last_proc_at: Instant::now(),
             runtime_cwd_dirty: false,
             runtime_cwd_dirty_panes: HashSet::new(),
@@ -13563,7 +13579,12 @@ fi
         assert_eq!(app.agent_usage[&key].tokens_in, 1200);
 
         app.handle_event(crate::event::AppEvent::UsageScanned {
-            scope: crate::mission::MissionScope::All,
+            request: crate::mission::MissionUsageRequest {
+                id: 0,
+                scope: crate::mission::MissionScope::All,
+                workspace: 0,
+                workspace_id: None,
+            },
             scanned: vec![key.clone()],
             usage: std::collections::HashMap::new(),
             mtimes: std::collections::HashMap::new(),
@@ -13622,7 +13643,12 @@ fi
         assert!(!app.reported_usage.contains_key(&old));
 
         app.handle_event(crate::event::AppEvent::UsageScanned {
-            scope: crate::mission::MissionScope::All,
+            request: crate::mission::MissionUsageRequest {
+                id: 0,
+                scope: crate::mission::MissionScope::All,
+                workspace: 0,
+                workspace_id: None,
+            },
             scanned: vec![old.clone()],
             usage: [(old.clone(), stale)].into(),
             mtimes: [(old.clone(), std::time::SystemTime::UNIX_EPOCH)].into(),
@@ -19162,7 +19188,12 @@ fi
         app.usage_mtimes.insert(second.clone(), original);
 
         app.handle_event(crate::event::AppEvent::UsageScanned {
-            scope: crate::mission::MissionScope::Workspace,
+            request: crate::mission::MissionUsageRequest {
+                id: 0,
+                scope: crate::mission::MissionScope::Workspace,
+                workspace: 0,
+                workspace_id: None,
+            },
             scanned: vec![first.clone()],
             usage: [(
                 first.clone(),
@@ -19185,7 +19216,12 @@ fi
             .any(|row| row.usage.as_ref().is_some_and(|usage| usage.tokens_in == 2)));
 
         app.handle_event(crate::event::AppEvent::UsageScanned {
-            scope: crate::mission::MissionScope::All,
+            request: crate::mission::MissionUsageRequest {
+                id: 0,
+                scope: crate::mission::MissionScope::All,
+                workspace: 0,
+                workspace_id: None,
+            },
             scanned: vec![first.clone()],
             usage: [(first.clone(), app.agent_usage[&first].clone())].into(),
             mtimes: [(first.clone(), refreshed)].into(),
@@ -19213,8 +19249,10 @@ fi
         assert_eq!(
             app.mission_usage_requested,
             Some(crate::mission::MissionUsageRequest {
+                id: 1,
                 scope: crate::mission::MissionScope::All,
                 workspace: usize::MAX,
+                workspace_id: None,
             })
         );
     }

@@ -1128,13 +1128,23 @@ impl App {
             // merge only the keys covered by a workspace scan. Repaint so a
             // visible mission tab updates.
             AppEvent::UsageScanned {
-                scope,
+                request,
                 scanned,
                 mut usage,
                 mut mtimes,
                 report_owned,
             } => {
-                self.usage_scan_inflight = false;
+                if request.id != 0 && self.mission_usage_inflight.as_ref() != Some(&request) {
+                    return false;
+                }
+                self.mission_usage_inflight = None;
+                if request.id != 0 {
+                    self.mission_usage_completed_id = request.id;
+                    self.mission_usage_completed_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|elapsed| elapsed.as_secs());
+                }
                 self.prune_reported_usage();
                 let excluded = report_owned
                     .into_iter()
@@ -1142,7 +1152,8 @@ impl App {
                     .collect::<std::collections::HashSet<_>>();
                 usage.retain(|key, _| !excluded.contains(key));
                 mtimes.retain(|key, _| !excluded.contains(key));
-                if scope == crate::mission::MissionScope::All {
+                if request.scope == crate::mission::MissionScope::All {
+                    self.mission_usage_attempted = scanned.iter().cloned().collect();
                     let mut next = usage;
                     for key in self.reported_usage.keys() {
                         if let Some(value) = self.agent_usage.get(key) {
@@ -1152,6 +1163,7 @@ impl App {
                     self.agent_usage = next;
                     self.usage_mtimes = mtimes;
                 } else {
+                    self.mission_usage_attempted.extend(scanned.iter().cloned());
                     for key in scanned {
                         if !self.reported_usage.contains_key(&key) {
                             self.agent_usage.remove(&key);
@@ -1165,16 +1177,60 @@ impl App {
                     );
                     self.usage_mtimes.extend(mtimes);
                 }
-                // Fleet burn rate: change in total cost since the last scan (docs/54).
-                let total: f64 = self.agent_usage.values().filter_map(|u| u.cost).sum();
+                // Drop identities no longer represented by a live or resumable
+                // row; historical refreshes must not grow this cache forever.
+                let current = self.mission_usage_targets_for(crate::mission::MissionScope::All, 0);
+                self.mission_usage_attempted
+                    .retain(|key| current.contains_key(key));
+
+                // Rates need two complete, comparable samples for the same
+                // scope and priced session set. A partial workspace refresh or
+                // an unavailable row must not produce a fabricated burn rate.
+                let workspace = self.mission_usage_workspace(&request);
+                let rows = self.build_mission_rows_for(request.scope, workspace);
+                let complete = !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row.usage.as_ref().and_then(|usage| usage.cost).is_some());
+                let usage = self
+                    .mission_usage_targets_for(request.scope, workspace)
+                    .into_keys()
+                    .filter_map(|key| {
+                        let entry = self.agent_usage.get(&key)?;
+                        // Copilot's native reader sums costs by model. Other
+                        // readers, integration reports, and pricing overrides
+                        // may reprice earlier tokens when the model changes.
+                        let cost_additive_across_models = key.agent == "copilot"
+                            && !self.reported_usage.contains_key(&key)
+                            && self.config.mission_pricing.is_empty();
+                        Some((
+                            key,
+                            crate::mission::MissionBurnPoint {
+                                model: entry.model.clone(),
+                                cost_additive_across_models,
+                                tokens_in: entry.tokens_in,
+                                tokens_out: entry.tokens_out,
+                                cache: entry.cache,
+                                cost: entry.cost?,
+                            },
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let total: f64 = usage.values().map(|entry| entry.cost).sum();
                 let now = std::time::Instant::now();
-                if let Some((prev, at)) = self.mission_last_cost {
-                    let dt = now.duration_since(at).as_secs_f64();
-                    if dt > 1.0 && total >= prev {
-                        self.mission_burn = Some((total - prev) / dt * 3600.0);
-                    }
-                }
-                self.mission_last_cost = Some((total, now));
+                let sample = complete.then_some(crate::mission::MissionBurnSample {
+                    scope: request.scope,
+                    workspace_id: request.workspace_id,
+                    usage,
+                    total,
+                    at: now,
+                });
+                self.mission_burn = self
+                    .mission_last_cost
+                    .as_ref()
+                    .zip(sample.as_ref())
+                    .and_then(|(previous, current)| previous.rate_to(current));
+                self.mission_last_cost = sample;
                 self.active_is_mission()
             }
             AppEvent::FileFilterResults {

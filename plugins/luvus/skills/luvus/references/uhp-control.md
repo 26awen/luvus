@@ -95,7 +95,9 @@ read current state and reconcile instead of blindly retrying.
 - Agents: `agent.*`, with `agent.prompt` preferred for atomic prompt submission
 - Search, files, Git, and review: `search.*`, `files.*`, `git.*`, and `diff.*`
 - Mission Control: read with `mission.snapshot`, refresh usage on demand with
-  `mission.refresh`, and change the visible UI only with `mission.open`
+  `mission.refresh`, then wait for `refresh.completed_id` to reach its
+  `refresh_id` in the same `server_generation`; `usage_status` explains null
+  usage. Change the visible UI only with `mission.open`
 - Worktrees and orchestration: `worktree.*`, `task.*`, and `lease.*`
   - `worktree.remove` refuses active agent, task, or lease ownership with
     `worktree_in_use`. Send `force: true` only with explicit approval to stop

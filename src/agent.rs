@@ -42,7 +42,7 @@ pub(crate) mod registry;
 pub(crate) mod shared;
 pub(crate) mod types;
 mod usage;
-pub use usage::{session_mtime, session_usage};
+pub use usage::{session_mtime, session_usage, supports_session_usage};
 
 /// A resumable agent session discovered on disk.
 #[derive(Clone)]

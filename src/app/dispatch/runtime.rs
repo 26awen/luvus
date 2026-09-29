@@ -428,24 +428,29 @@ impl App {
         // `layout()` below would index an empty `workspaces`. The server keeps
         // ticking here with no clients attached, so this is a live path, not a
         // theoretical one.
-        if self.workspaces.is_empty() || self.workspaces[self.active_ws].tabs.is_empty() {
-            return repaired_location;
-        }
-        let repaired_location = self.follow_active_file_root() || repaired_location;
-        self.schedule_runtime_scans(now, clients_attached);
+        let has_active_workspace =
+            !self.workspaces.is_empty() && !self.workspaces[self.active_ws].tabs.is_empty();
+        let repaired_location = if has_active_workspace {
+            let repaired_location = self.follow_active_file_root() || repaired_location;
+            self.schedule_runtime_scans(now, clients_attached);
+            repaired_location
+        } else {
+            repaired_location
+        };
         // Mission Control usage is demand-driven. Opening/focusing the dashboard,
         // changing scope, or pressing/clicking refresh queues one worker scan;
         // merely retaining a hidden mission tab performs no usage IO.
         self.sync_mission_usage_visibility();
-        if self.mission_usage_requested.is_some() && !self.usage_scan_inflight {
+        if self.mission_usage_requested.is_some() && self.mission_usage_inflight.is_none() {
             let request = self
                 .mission_usage_requested
                 .take()
                 .expect("usage request checked above");
-            self.usage_scan_inflight = true;
-            let targets = self.mission_usage_targets_for(request.scope, request.workspace);
+            self.mission_usage_requested = self.mission_usage_queued.pop_front();
+            self.mission_usage_inflight = Some(request.clone());
+            let workspace = self.mission_usage_workspace(&request);
+            let targets = self.mission_usage_targets_for(request.scope, workspace);
             let scanned = targets.keys().cloned().collect::<Vec<_>>();
-            let scope = request.scope;
             let overrides = self.config.mission_pricing.clone();
             // Previous results let an explicit refresh reuse unchanged transcripts:
             // one stat per idle session, with no read or parse.
@@ -493,13 +498,16 @@ impl App {
                     }
                 }
                 let _ = tx.send(AppEvent::UsageScanned {
-                    scope,
+                    request,
                     scanned,
                     usage,
                     mtimes,
                     report_owned,
                 });
             });
+        }
+        if !has_active_workspace {
+            return repaired_location;
         }
         // The per-pane classification below locks each pane's VT engine + scans its
         // grid; agent state (blocked/working/done) is human-paced, so ~100ms is

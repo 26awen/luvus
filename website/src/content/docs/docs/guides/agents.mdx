@@ -63,6 +63,11 @@ Open Mission Control with `Ctrl+Space m`, from the desktop switcher, or with
 workspace-scoped operation through UHP as `mission.open`. To read Mission
 Control data without opening or focusing the tab, use `mission.snapshot`; use
 `mission.refresh` only when fresh native usage counters are needed.
+For UHP, keep the returned `refresh_id` and read `mission.snapshot` after its
+`refresh.completed_id` reaches that ID. `usage:null` means unknown, not zero;
+`usage_status` explains whether the row is unrefreshed, in flight, unbound to a
+native session, unsupported, or unavailable after a scan. Summary totals are
+known subtotals when `usage_coverage` is incomplete.
 
 Mission Control reads the structured usage counters that each agent already
 stores for its own session. It shows input, output, and cache tokens, context
