@@ -52,6 +52,8 @@ pub(crate) struct MissionBurnSample {
 /// Counters needed to distinguish new usage from a cost-only correction.
 pub(crate) struct MissionBurnPoint {
     pub model: String,
+    /// Native per-model totals remain additive when the display model changes.
+    pub cost_additive_across_models: bool,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cache: u64,
@@ -72,7 +74,8 @@ impl MissionBurnSample {
         }
         for (key, current) in &next.usage {
             let previous = self.usage.get(key)?;
-            if current.model != previous.model
+            if current.cost_additive_across_models != previous.cost_additive_across_models
+                || (current.model != previous.model && !current.cost_additive_across_models)
                 || current.tokens_in < previous.tokens_in
                 || current.tokens_out < previous.tokens_out
                 || current.cache < previous.cache

@@ -1176,10 +1176,17 @@ impl App {
                     .into_keys()
                     .filter_map(|key| {
                         let entry = self.agent_usage.get(&key)?;
+                        // Copilot's native reader sums costs by model. Other
+                        // readers, integration reports, and pricing overrides
+                        // may reprice earlier tokens when the model changes.
+                        let cost_additive_across_models = key.agent == "copilot"
+                            && !self.reported_usage.contains_key(&key)
+                            && self.config.mission_pricing.is_empty();
                         Some((
                             key,
                             crate::mission::MissionBurnPoint {
                                 model: entry.model.clone(),
+                                cost_additive_across_models,
                                 tokens_in: entry.tokens_in,
                                 tokens_out: entry.tokens_out,
                                 cache: entry.cache,

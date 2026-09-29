@@ -348,6 +348,55 @@ fn mission_burn_ignores_cost_only_corrections_with_other_usage() {
 }
 
 #[test]
+fn mission_burn_accepts_native_copilot_model_switch_without_overrides() {
+    let _env = crate::persist::test_env("mission-burn-copilot-model-switch");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(100, 30, tx).unwrap();
+    let pane = app.layout().focus;
+    app.status.get_mut(&pane).unwrap().agent = "copilot".into();
+    app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
+        agent: "copilot".into(),
+        session_id: "mixed-models".into(),
+    });
+    let key = crate::mission::UsageKey::new("copilot", "mixed-models");
+    let scanned = |model: &str, tokens_in, cost| crate::event::AppEvent::UsageScanned {
+        request: crate::mission::MissionUsageRequest {
+            id: 0,
+            scope: crate::mission::MissionScope::All,
+            workspace: 0,
+            workspace_id: None,
+        },
+        scanned: vec![key.clone()],
+        usage: [(
+            key.clone(),
+            crate::mission::AgentUsage {
+                model: model.into(),
+                tokens_in,
+                cost: Some(cost),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        mtimes: Default::default(),
+        report_owned: Vec::new(),
+    };
+
+    app.handle_event(scanned("model-a", 100, 1.0));
+    assert!(app.mission_last_cost.as_ref().unwrap().usage[&key].cost_additive_across_models);
+    app.mission_last_cost.as_mut().unwrap().at -= std::time::Duration::from_secs(2);
+    app.handle_event(scanned("model-b", 120, 1.3));
+    assert!(app.mission_burn.is_some_and(|rate| rate > 0.0));
+
+    // With overrides, a dominant-model change can reprice the whole session.
+    app.mission_last_cost.as_mut().unwrap().at -= std::time::Duration::from_secs(2);
+    app.config
+        .mission_pricing
+        .insert("model-b".into(), [1.0, 1.0, 1.0]);
+    app.handle_event(scanned("model-c", 130, 1.5));
+    assert!(app.mission_burn.is_none());
+}
+
+#[test]
 fn theme_api_lists_validates_and_applies_registry_entries() {
     let _env = crate::persist::test_env("theme-api");
     let source = crate::persist::ensure_config_dir().join("api-theme.toml");
