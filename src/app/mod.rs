@@ -1736,6 +1736,10 @@ pub struct MouseGrab {
     pub btn: u16,
     pub drag: bool,
     pub sgr: bool,
+    /// Pane-local cell of the last event forwarded for this gesture. The
+    /// release is sent here if the pane is no longer on screen, so the child
+    /// still learns that the button came up.
+    pub last: (u16, u16),
 }
 
 /// The board's **start-worker picker**: choose which agent to launch in the

@@ -1360,6 +1360,33 @@ impl App {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let kind = m.kind;
+        // A forwarded gesture owns the pointer until its button comes up, like
+        // pointer capture. This runs before every overlay, modal, Commander,
+        // copy mode, and layout control, so none of them can swallow the
+        // owning release (leaving a stale grab that drops later clicks) or act
+        // on a press mid-gesture (a compact pane switch would take the grabbed
+        // pane off screen). The child protocol permits several held buttons,
+        // but Luvus tracks one forwarded gesture at a time, so every other
+        // button's press, drag, and release is consumed.
+        if let Some(g) = self.mouse_grab {
+            match kind {
+                MouseEventKind::Drag(button) => {
+                    if button == g.button && g.drag {
+                        self.send_grabbed_mouse(g, MouseSeq::Drag, m.column, m.row);
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(button) => {
+                    if button == g.button {
+                        self.mouse_grab = None;
+                        self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
+                    }
+                    return true;
+                }
+                MouseEventKind::Down(_) => return true,
+                _ => {}
+            }
+        }
         if self.mode == Mode::PaneNavigate && !matches!(kind, MouseEventKind::Moved) {
             self.pane_navigation = None;
             self.mode = Mode::Normal;
@@ -2225,13 +2252,6 @@ impl App {
         // highlight (docs/27, RESIZE-4), plus the sidebar edge seam (docs/29).
         self.update_hover_divider(m.column, m.row);
         self.update_hover_sidebar(m.column, m.row);
-        // The child protocol permits more than one pressed button, but Luvus
-        // deliberately tracks one forwarded gesture at a time. Ignore another
-        // press until the owning button releases so it cannot replace the grab
-        // and leave the child believing the first button is still held.
-        if self.mouse_grab.is_some() && matches!(m.kind, MouseEventKind::Down(_)) {
-            return;
-        }
         // Right-click a pane tab, WORKSPACES row, live/scheduled agent, ORCH
         // row, file, dock row, or pane to open the matching context menu.
         // A mouse-aware application owns an unmodified right-click inside its
@@ -2469,15 +2489,8 @@ impl App {
             MouseEventKind::Drag(button @ MouseButton::Left)
             | MouseEventKind::Drag(button @ MouseButton::Middle)
             | MouseEventKind::Drag(button @ MouseButton::Right) => {
-                // Only the button that opened a forwarded gesture may move it.
-                // An unrelated drag is consumed without touching the child or
-                // an existing Luvus selection.
-                if let Some(g) = self.mouse_grab {
-                    if g.button == button && g.drag {
-                        self.send_grabbed_mouse(g, MouseSeq::Drag, m.column, m.row);
-                    }
-                    return;
-                }
+                // A forwarded gesture's drags were routed by the capture at
+                // the top of `handle_mouse`; only unowned drags reach here.
                 if button != MouseButton::Left {
                     return;
                 }
@@ -2515,15 +2528,8 @@ impl App {
             MouseEventKind::Up(button @ MouseButton::Left)
             | MouseEventKind::Up(button @ MouseButton::Middle)
             | MouseEventKind::Up(button @ MouseButton::Right) => {
-                // A secondary button cannot close the active forwarded grab.
-                // Consume its release and wait for the owning button instead.
-                if let Some(g) = self.mouse_grab {
-                    if g.button == button {
-                        self.mouse_grab = None;
-                        self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
-                    }
-                    return;
-                }
+                // A forwarded gesture's release was routed by the capture at
+                // the top of `handle_mouse`; only unowned releases reach here.
                 // Middle and right releases have no host-selection semantics.
                 // In particular, a right drag that began outside every pane
                 // must not extend and copy an older left-button selection.
@@ -3488,6 +3494,7 @@ impl App {
             btn: base_btn + mouse_mod_bits(m.modifiers),
             drag: mm.drag,
             sgr: mm.sgr,
+            last: (1, 1),
         };
         self.mouse_grab = Some(g);
         self.send_grabbed_mouse(g, MouseSeq::Press, m.column, m.row);
@@ -3500,22 +3507,25 @@ impl App {
     /// reports sane positions. Counts as user input for detection, like the
     /// forwarded wheel.
     fn send_grabbed_mouse(&mut self, g: crate::app::MouseGrab, kind: MouseSeq, x: u16, y: u16) {
-        let Some(content) = self
+        let content = self
             .pane_content_rects
             .iter()
             .find(|(pid, _)| *pid == g.pane)
-            .map(|(_, r)| *r)
-        else {
+            .map(|(_, r)| *r);
+        let Some((cell, bytes)) = grab_event_seq(&g, kind, x, y, content) else {
             return;
         };
-        let cx = x.clamp(content.x, content.right().saturating_sub(1));
-        let cy = y.clamp(content.y, content.bottom().saturating_sub(1));
-        let col = cx - content.x + 1;
-        let row = cy - content.y + 1;
         if let Some(pane) = self.panes.get(&g.pane) {
-            pane.send(&mouse_button_seq(g.btn, kind, col, row, g.sgr));
+            pane.send(&bytes);
         }
         self.mark_input_for(g.pane);
+        // Remember where the child last saw this gesture, for a release that
+        // arrives after the pane has left the screen.
+        if let Some(active) = self.mouse_grab.as_mut() {
+            if active.pane == g.pane && active.button == g.button {
+                active.last = cell;
+            }
+        }
     }
 
     /// `pub(super)` so the resize hit-test in `app` can share this exact rule:
@@ -4620,6 +4630,33 @@ fn mouse_mod_bits(mods: ratatui::crossterm::event::KeyModifiers) -> u16 {
 /// press/drag (`m` for release), with +32 on the code while moving. Legacy
 /// X10: `ESC [M` + three offset bytes, release encoded as button 3 (modifier
 /// bits kept).
+/// Encode one event of a forwarded gesture, returning the pane-local cell it
+/// was reported at. Coordinates are clamped into the pane's content, so a drag
+/// that wanders outside still reports a sane position.
+///
+/// A pane with no content rectangle is not on screen, for example after a tab
+/// switch or a compact-layout pane change mid-gesture. Presses and drags are
+/// then dropped, but a release is still sent at the last cell the child saw:
+/// dropping it would leave the child believing the button is held forever.
+fn grab_event_seq(
+    g: &crate::app::MouseGrab,
+    kind: MouseSeq,
+    x: u16,
+    y: u16,
+    content: Option<Rect>,
+) -> Option<((u16, u16), Vec<u8>)> {
+    let cell = match content {
+        Some(content) => {
+            let cx = x.clamp(content.x, content.right().saturating_sub(1));
+            let cy = y.clamp(content.y, content.bottom().saturating_sub(1));
+            (cx - content.x + 1, cy - content.y + 1)
+        }
+        None if matches!(kind, MouseSeq::Release) => g.last,
+        None => return None,
+    };
+    Some((cell, mouse_button_seq(g.btn, kind, cell.0, cell.1, g.sgr)))
+}
+
 fn mouse_button_seq(btn: u16, kind: MouseSeq, col: u16, row: u16, sgr: bool) -> Vec<u8> {
     let motion = if kind == MouseSeq::Drag { 32 } else { 0 };
     if sgr {
@@ -8086,6 +8123,179 @@ mod link_click_tests {
         app.status.get_mut(&pane).expect("pane status").agent = "codex".into();
         assert_eq!(app.selection_text(), shell);
         assert_eq!(shell.as_deref(), Some(" hello"));
+    }
+
+    /// Turn on button-event mouse tracking (1002) with SGR encoding (1006) in
+    /// a pane, as a mouse-aware TUI would.
+    fn enable_mouse_tracking(app: &App, pane: crate::ids::PaneId) {
+        app.panes
+            .get(&pane)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[?1002h\x1b[?1006h");
+    }
+
+    /// Help opened by a shortcut mid-gesture must not swallow the grab's
+    /// release. Before pointer capture ran first, the stale grab then dropped
+    /// every left click into the pane until another right release arrived.
+    #[test]
+    fn help_cannot_swallow_a_forwarded_release() {
+        let _env = crate::persist::test_env("grab-release-under-help");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        enable_mouse_tracking(&app, pane);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.mouse_grab.map(|g| g.button), Some(MouseButton::Right));
+
+        app.help_open = true; // a keyboard shortcut opened it mid-gesture
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.mouse_grab.is_none(), "the release ended the grab");
+        assert!(
+            app.help_open,
+            "a release is not a click that dismisses help"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert!(!app.help_open, "the next click dismisses help");
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.mouse_grab.map(|g| g.button),
+            Some(MouseButton::Left),
+            "a later left click reaches the pane instead of being dropped"
+        );
+    }
+
+    /// A press on the compact previous/next controls mid-gesture must not
+    /// switch panes: that takes the grabbed pane off screen before its release.
+    #[test]
+    fn compact_pane_controls_wait_for_a_forwarded_release() {
+        let _env = crate::persist::test_env("grab-compact-nav");
+        let Fixture {
+            mut app, mut term, ..
+        } = fixture();
+        let first = app.layout().focus;
+        app.split_pane(first, crate::layout::Axis::Col, false)
+            .expect("second pane");
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.layout().focus, first);
+        enable_mouse_tracking(&app, first);
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == first)
+            .map(|(_, rect)| *rect)
+            .expect("first pane content");
+        let inside = (content.x + 1, content.y);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            inside,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.mouse_grab.map(|g| g.button), Some(MouseButton::Right));
+
+        let next = Rect::new(0, 39, 3, 1);
+        app.mobile_pane_next_rect = Some(next);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (next.x + 1, next.y),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.layout().focus, first, "no pane switch mid-gesture");
+        assert_eq!(app.mouse_grab.map(|g| g.button), Some(MouseButton::Right));
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Right),
+            inside,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.mouse_grab.is_none());
+    }
+
+    /// A release is still encoded when the grabbed pane is no longer on screen,
+    /// at the last cell the child saw. Presses and drags are not.
+    #[test]
+    fn a_release_reaches_a_pane_that_left_the_screen() {
+        let grab = crate::app::MouseGrab {
+            pane: crate::ids::PaneId(7),
+            button: MouseButton::Right,
+            btn: 2,
+            drag: true,
+            sgr: true,
+            last: (7, 3),
+        };
+        assert_eq!(
+            grab_event_seq(&grab, MouseSeq::Release, 90, 40, None),
+            Some(((7, 3), b"\x1b[<2;7;3m".to_vec()))
+        );
+        assert_eq!(grab_event_seq(&grab, MouseSeq::Drag, 90, 40, None), None);
+        assert_eq!(grab_event_seq(&grab, MouseSeq::Press, 90, 40, None), None);
+
+        // On screen, coordinates are pane-local and clamped into the content.
+        let content = Rect::new(10, 5, 20, 10);
+        assert_eq!(
+            grab_event_seq(&grab, MouseSeq::Release, 100, 1, Some(content)),
+            Some(((20, 1), b"\x1b[<2;20;1m".to_vec()))
+        );
+    }
+
+    /// Every forwarded event records where the child saw it, so a later
+    /// off-screen release lands on the same cell.
+    #[test]
+    fn a_forwarded_press_records_the_cell_the_child_saw() {
+        let _env = crate::persist::test_env("grab-last-cell");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        enable_mouse_tracking(&app, pane);
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.mouse_grab.map(|g| g.last),
+            Some((off_link.0 - content.x + 1, off_link.1 - content.y + 1))
+        );
     }
 
     #[test]
