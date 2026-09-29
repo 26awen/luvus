@@ -58,6 +58,8 @@ fn mission_snapshot_and_refresh_are_read_only_ui_independent_controls() {
     assert_eq!(snapshot["type"], "mission_snapshot");
     assert_eq!(snapshot["rows"][0]["kind"], "resumable");
     assert_eq!(snapshot["rows"][0]["usage"]["total_tokens"], 150);
+    assert_eq!(snapshot["rows"][0]["usage_status"], "available");
+    assert_eq!(snapshot["summary"]["usage_coverage"]["available"], 1);
     assert!(
         snapshot["rows"][0].get("session_id").is_none(),
         "read scope does not expose native session identifiers"
@@ -72,11 +74,18 @@ fn mission_snapshot_and_refresh_are_read_only_ui_independent_controls() {
         .dispatch("mission.refresh", &json!({"scope":"all"}))
         .unwrap();
     assert_eq!(refreshed["type"], "mission_refresh");
+    assert_eq!(refreshed["refresh_id"], "1");
+    assert_eq!(
+        refreshed["server_generation"],
+        app.backend_server_generation
+    );
     assert_eq!(
         app.mission_usage_requested,
         Some(crate::mission::MissionUsageRequest {
+            id: 1,
             scope: crate::mission::MissionScope::All,
             workspace: 0,
+            workspace_id: None,
         })
     );
     assert_eq!(
@@ -95,6 +104,129 @@ fn mission_snapshot_and_refresh_are_read_only_ui_independent_controls() {
         .expect("all-workspace scope does not depend on its anchor index");
     assert_eq!(all["type"], "mission_snapshot");
     assert_eq!(all["rows"][0]["kind"], "resumable");
+    assert_eq!(all["refresh"]["completed_id"], "0");
+    assert_eq!(
+        all["refresh"]["server_generation"],
+        app.backend_server_generation
+    );
+    assert_eq!(all["refreshing"], true);
+}
+
+#[test]
+fn mission_snapshot_explains_missing_usage_and_refresh_completion() {
+    let _env = crate::persist::test_env("mission-usage-status-api");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(100, 30, tx).unwrap();
+    let pane = app.layout().focus;
+    app.status.get_mut(&pane).unwrap().agent = "claude".into();
+
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["rows"][0]["usage_status"], "unbound");
+    assert_eq!(snapshot["summary"]["usage_coverage"]["available"], 0);
+
+    app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
+        agent: "claude".into(),
+        session_id: "missing-ledger".into(),
+    });
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["rows"][0]["usage_status"], "not_refreshed");
+
+    let refresh = app.dispatch("mission.refresh", &json!({})).unwrap();
+    assert_eq!(refresh["refresh_id"], "1");
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["rows"][0]["usage_status"], "refreshing");
+    let request = app.mission_usage_requested.take().unwrap();
+    app.mission_usage_inflight = Some(request.clone());
+    app.handle_event(crate::event::AppEvent::UsageScanned {
+        request,
+        scanned: vec![crate::mission::UsageKey::new("claude", "missing-ledger")],
+        usage: Default::default(),
+        mtimes: Default::default(),
+        report_owned: Vec::new(),
+    });
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["refresh"]["completed_id"], "1");
+    assert_eq!(snapshot["refreshing"], false);
+    assert_eq!(snapshot["rows"][0]["usage_status"], "unavailable");
+    assert!(snapshot["summary"]["burn_usd_per_hour"].is_null());
+
+    app.status.get_mut(&pane).unwrap().agent = "opencode".into();
+    app.status.get_mut(&pane).unwrap().agent_session = Some(crate::app::AgentSession {
+        agent: "opencode".into(),
+        session_id: "reported".into(),
+    });
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["rows"][0]["usage_status"], "unsupported");
+    app.agent_usage.insert(
+        crate::mission::UsageKey::new("opencode", "reported"),
+        crate::mission::AgentUsage {
+            cost: Some(-0.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = app.dispatch("mission.snapshot", &json!({})).unwrap();
+    assert_eq!(snapshot["rows"][0]["usage_status"], "available");
+    assert!(snapshot["summary"]["cost_usd"]
+        .as_f64()
+        .unwrap()
+        .is_sign_positive());
+}
+
+#[test]
+fn mission_refresh_preserves_distinct_pending_scopes() {
+    let _env = crate::persist::test_env("mission-refresh-queue-api");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(100, 30, tx).unwrap();
+    let first = app.dispatch("mission.refresh", &json!({})).unwrap();
+    let second = app
+        .dispatch("mission.refresh", &json!({"scope":"all"}))
+        .unwrap();
+    let repeated = app.dispatch("mission.refresh", &json!({})).unwrap();
+    assert_eq!(first["refresh_id"], "1");
+    assert_eq!(second["refresh_id"], "2");
+    assert_eq!(repeated["refresh_id"], "1");
+    assert_eq!(app.mission_usage_requested.as_ref().unwrap().id, 1);
+    assert_eq!(app.mission_usage_queued.front().unwrap().id, 2);
+
+    // Simulate the worker taking the first request. A new same-scope request
+    // needs a later ticket rather than claiming an already-running scan.
+    let first = app.mission_usage_requested.take().unwrap();
+    app.mission_usage_requested = app.mission_usage_queued.pop_front();
+    app.mission_usage_inflight = Some(first.clone());
+    let later = app.dispatch("mission.refresh", &json!({})).unwrap();
+    assert_eq!(later["refresh_id"], "3");
+
+    let stale = crate::mission::MissionUsageRequest {
+        id: 99,
+        ..first.clone()
+    };
+    assert!(!app.handle_event(crate::event::AppEvent::UsageScanned {
+        request: stale,
+        scanned: Vec::new(),
+        usage: Default::default(),
+        mtimes: Default::default(),
+        report_owned: Vec::new(),
+    }));
+    assert_eq!(app.mission_usage_inflight.as_ref().unwrap().id, 1);
+    assert_eq!(app.mission_usage_completed_id, 0);
+
+    app.handle_event(crate::event::AppEvent::UsageScanned {
+        request: first,
+        scanned: Vec::new(),
+        usage: Default::default(),
+        mtimes: Default::default(),
+        report_owned: Vec::new(),
+    });
+    assert_eq!(app.mission_usage_completed_id, 1);
+    assert!(app.mission_usage_refreshing());
+    assert_eq!(app.mission_usage_requested.as_ref().unwrap().id, 2);
+
+    // A queued workspace request must not follow a reused numeric index after
+    // its original workspace is removed or replaced.
+    let queued_workspace = app.mission_usage_queued.front().unwrap().clone();
+    assert_eq!(app.mission_usage_workspace(&queued_workspace), 0);
+    app.workspaces[0].id = "replacement-workspace".into();
+    assert_eq!(app.mission_usage_workspace(&queued_workspace), usize::MAX);
 }
 
 #[test]

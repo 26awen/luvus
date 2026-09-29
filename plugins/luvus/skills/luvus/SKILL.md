@@ -520,7 +520,11 @@ surface:
   workspace scope (the default) or explicit all-workspace scope to inspect
   data without changing the UI,
   `mission.refresh` for an explicit usage refresh, and `mission.open` only to
-  change the visible tab.
+  change the visible tab. Keep the `refresh_id` from `mission.refresh` and read
+  `mission.snapshot` until `refresh.completed_id` reaches it in the same
+  `server_generation`. `usage:null` is unknown, not zero; use `usage_status`
+  and `summary.usage_coverage` to explain partial results. `scope:"all"` stays
+  inside the selected named session.
 - Agent detection is built into Luvus. `luvus integration install` manages
   optional native session-resume hooks and must not be used merely to make an
   agent appear in the sidebar. Install or remove an integration only when the

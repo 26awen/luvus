@@ -918,12 +918,21 @@ impl App {
                 ));
             }
             if method == "mission.refresh" {
-                self.request_mission_usage_refresh_for(scope, workspace);
+                let refresh_id = self
+                    .request_mission_usage_refresh_for(scope, workspace)
+                    .ok_or_else(|| {
+                        (
+                            "resource_exhausted".to_string(),
+                            "too many pending Mission Control refreshes".to_string(),
+                        )
+                    })?;
                 Ok(json!({
                     "type":"mission_refresh",
                     "scope":match scope { crate::mission::MissionScope::Workspace => "workspace", crate::mission::MissionScope::All => "all" },
                     "workspace":workspace.to_string(),
                     "refreshing":true,
+                    "refresh_id":refresh_id.to_string(),
+                    "server_generation":self.backend_server_generation,
                 }))
             } else {
                 Ok(self.mission_snapshot_value(scope, workspace))

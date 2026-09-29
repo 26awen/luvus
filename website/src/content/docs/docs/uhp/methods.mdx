@@ -727,13 +727,32 @@ It deliberately omits native session IDs and blocked-output snippets. It does
 not open Mission Control or change focus.
 
 `mission.refresh` schedules one demand-driven usage scan. It performs no
-continuous polling; call `mission.snapshot` again to read the updated cache.
+continuous polling. Its `refresh_id` is a decimal string; call
+`mission.snapshot` again until the snapshot has the same `server_generation`
+under `refresh` and its numeric `refresh.completed_id` is at least that ID.
+Discard a ticket after a
+server restart. Refresh requests for different scopes are queued rather than
+replacing each other. A snapshot remains a read-only cache projection and never
+starts a scan itself.
 Both methods accept `scope:"workspace"` (default) or `scope:"all"`, plus an
 optional zero-based `workspace` or stable `workspace_id`.
+`all` covers every workspace in the **selected named session**, not other named
+sessions.
+
+Each row retains `usage:null` when counters are unknown, with `usage_status`
+explaining why: `not_refreshed`, `refreshing`, `unbound` (no exact native session
+identity), `unsupported` (no native reader), or `unavailable` (a scan found no
+usable structured counters). `available` means `usage` contains measured
+counters. An integration can provide counters even for an agent without a native
+reader. Agent `state` is independent of usage; `working` does not guarantee a
+usage record. `summary.usage_coverage` reports available and priced rows and
+whether token and cost totals cover every row. Totals are known subtotals when
+coverage is incomplete. Burn rate stays `null` until two complete, comparable
+refreshes exist; zero is not substituted for missing measurements.
 
 ```json
 → {"id":"m1","method":"mission.snapshot","params":{"scope":"all"}}
-← {"id":"m1","result":{"type":"mission_snapshot","scope":"all","refreshing":false,"summary":{"agents":0,"tokens":0,"cost_usd":0.0,"burn_usd_per_hour":0.0},"automation":{"summary":{"definitions":0,"enabled":0,"scheduled":0,"running":0,"review":0,"failed":0,"next_run_at":null},"rows":[]},"rows":[]}}
+← {"id":"m1","result":{"type":"mission_snapshot","scope":"all","refreshing":false,"refresh":{"server_generation":"example-generation","completed_id":"0","completed_at":null},"summary":{"agents":0,"tokens":0,"cost_usd":0.0,"burn_usd_per_hour":null,"usage_coverage":{"available":0,"priced":0,"total":0,"tokens_complete":true,"cost_complete":true}},"automation":{"summary":{"definitions":0,"enabled":0,"scheduled":0,"running":0,"review":0,"failed":0,"next_run_at":null},"rows":[]},"rows":[]}}
 ```
 
 `mission.open` opens Mission Control in the active workspace. Pass a zero-based
@@ -742,8 +761,8 @@ The dashboard is reused when it is already open.
 
 | Method | Params | Result |
 |---|---|---|
-| `mission.snapshot` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_snapshot", summary, rows, refreshing}` |
-| `mission.refresh` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_refresh", refreshing:true}` |
+| `mission.snapshot` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_snapshot", summary, rows, refresh, refreshing}` |
+| `mission.refresh` | `{scope?, workspace?}` or `{scope?, workspace_id?}` | `{type:"mission_refresh", refresh_id, server_generation, refreshing:true}` |
 | `mission.open` | `{workspace?}` or `{workspace_id?}` | `{type:"ok", mission:true}` |
 
 The CLI equivalent is `luvus mission open [<workspace>]`. This is a write

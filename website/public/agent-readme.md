@@ -399,6 +399,10 @@ a zero-based workspace with `luvus mission open <workspace>`, or call the
 workspace-scoped UHP method `mission.open`. Use `mission.snapshot` to read agent
 and usage data without changing the UI. `mission.refresh` requests one explicit
 off-render-path usage scan rather than enabling background polling.
+Keep its `refresh_id` and read snapshots until `refresh.completed_id` reaches
+that ID in the same `server_generation`. Null usage means unknown, not zero;
+inspect `usage_status` and `summary.usage_coverage` before treating totals as
+complete. `scope:"all"` covers only the selected named session.
 
 Use `automation.preview` before storing a calendar trigger, then
 `automation.create` with a canonical built-in agent, stable workspace ID,

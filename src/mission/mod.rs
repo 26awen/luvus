@@ -26,10 +26,27 @@ pub enum MissionScope {
 /// One demand-driven usage scan requested by Mission Control or UHP. Keeping
 /// the scope and anchor workspace in the request lets automation inspect the
 /// fleet without changing the user's active workspace or dashboard state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MissionUsageRequest {
+    pub id: u64,
     pub scope: MissionScope,
     pub workspace: usize,
+    /// Stable identity fences a queued workspace scan against index reuse.
+    pub workspace_id: Option<String>,
+}
+
+/// UHP callers may request different scopes while a scan is running. Bound
+/// queued work instead of silently replacing an earlier caller's refresh.
+pub(crate) const MAX_PENDING_USAGE_REFRESHES: usize = 64;
+
+/// One comparable cost sample. A rate is only meaningful when both refreshes
+/// cover the same scope and the same set of priced native sessions.
+pub(crate) struct MissionBurnSample {
+    pub scope: MissionScope,
+    pub workspace_id: Option<String>,
+    pub keys: std::collections::HashSet<UsageKey>,
+    pub total: f64,
+    pub at: std::time::Instant,
 }
 
 /// Stable cache identity for a native usage ledger. Session identifiers are
