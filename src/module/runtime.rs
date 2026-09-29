@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,11 @@ pub const MAX_IN_FLIGHT: usize = 32;
 pub const LOG_LIMIT: usize = 200;
 pub const OUTPUT_CAP: usize = 64 * 1024;
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long an action without a lifetime deadline may keep its pipes open
+/// after its direct child exits. A descendant it started in the background can
+/// inherit stdout/stderr/stdin; past this grace the run is reported complete
+/// rather than left Running until that descendant happens to exit.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 pub const MODULE_TOKEN_ENV: &str = "LUVUS_MODULE_TOKEN";
 
 /// Commander always sends its versioned document, even when the action
@@ -315,8 +321,27 @@ fn run_with_input(
     let deadline = timeout.map(|duration| Instant::now() + duration);
     let mut so = child.stdout.take();
     let mut se = child.stderr.take();
-    let t_out = thread::spawn(move || so.as_mut().map(read_capped).unwrap_or_default());
-    let t_err = thread::spawn(move || se.as_mut().map(read_capped).unwrap_or_default());
+    // The readers fill shared buffers rather than returning a String, so a run
+    // whose pipes are still held open by a background descendant can report
+    // what it captured without joining a reader that may never finish.
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let t_out = {
+        let sink = Arc::clone(&out_buf);
+        thread::spawn(move || {
+            if let Some(r) = so.as_mut() {
+                read_capped_into(r, &sink);
+            }
+        })
+    };
+    let t_err = {
+        let sink = Arc::clone(&err_buf);
+        thread::spawn(move || {
+            if let Some(r) = se.as_mut() {
+                read_capped_into(r, &sink);
+            }
+        })
+    };
     let (status, process_timed_out, process_cancelled) =
         wait_for_child(&mut child, deadline, cancelled);
     let (output_timed_out, output_cancelled) =
@@ -348,11 +373,26 @@ fn run_with_input(
             return (None, String::new(), message);
         }
     }
-    let input_result = t_in
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("module stdin writer panicked")));
-    let out = t_out.join().unwrap_or_default();
-    let mut err = t_err.join().unwrap_or_default();
+    // Without a lifetime deadline the direct child has now exited. Bound only
+    // the pipe drain: a descendant that inherited a handle must not keep the
+    // run marked Running indefinitely. It is left running, because an action
+    // may background work deliberately, and the child's real status is kept.
+    let output_detached =
+        deadline.is_none() && !drained_within(&t_in, &t_out, &t_err, OUTPUT_DRAIN_GRACE);
+    let input_result = if t_in.is_finished() {
+        t_in.join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("module stdin writer panicked")))
+    } else {
+        // The child exited without draining stdin while a descendant still
+        // holds its read end. That is not a delivery failure of this run.
+        Ok(())
+    };
+    if !output_detached {
+        let _ = t_out.join();
+        let _ = t_err.join();
+    }
+    let out = captured(&out_buf);
+    let mut err = captured(&err_buf);
     let closed_stdin_is_ok = allow_closed_on_success
         && input_result
             .as_ref()
@@ -366,6 +406,15 @@ fn run_with_input(
             }
             err.push_str(&format!("write stdin failed: {error}"));
         }
+    }
+    if output_detached {
+        if !err.is_empty() && !err.ends_with('\n') {
+            err.push('\n');
+        }
+        err.push_str(
+            "a background process kept this action's output open after it exited; \
+             later output was not captured",
+        );
     }
     drop(tree_guard);
     if timed_out || was_cancelled {
@@ -417,8 +466,8 @@ fn wait_for_child(
 
 fn wait_for_output(
     stdin: &thread::JoinHandle<std::io::Result<()>>,
-    stdout: &thread::JoinHandle<String>,
-    stderr: &thread::JoinHandle<String>,
+    stdout: &thread::JoinHandle<()>,
+    stderr: &thread::JoinHandle<()>,
     deadline: Option<Instant>,
     cancelled: Option<&AtomicBool>,
 ) -> (bool, bool) {
@@ -453,14 +502,14 @@ fn terminate_process_tree(pid: u32) {
 }
 
 /// Read to EOF (so the child never blocks on a full pipe) but retain only the
-/// first OUTPUT_CAP bytes.
-fn read_capped<R: Read>(r: &mut R) -> String {
-    let mut kept = Vec::new();
+/// first OUTPUT_CAP bytes, appended to `sink` as they arrive.
+fn read_capped_into<R: Read>(r: &mut R, sink: &Mutex<Vec<u8>>) {
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
+                let mut kept = sink.lock().unwrap_or_else(|e| e.into_inner());
                 if kept.len() < OUTPUT_CAP {
                     let take = (OUTPUT_CAP - kept.len()).min(n);
                     kept.extend_from_slice(&chunk[..take]);
@@ -470,7 +519,31 @@ fn read_capped<R: Read>(r: &mut R) -> String {
             Err(_) => break,
         }
     }
+}
+
+/// The bytes a reader has captured so far, as text.
+fn captured(buf: &Mutex<Vec<u8>>) -> String {
+    let kept = buf.lock().unwrap_or_else(|e| e.into_inner());
     String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Wait up to `grace` for all three I/O threads; true when they all finished.
+fn drained_within(
+    stdin: &thread::JoinHandle<std::io::Result<()>>,
+    stdout: &thread::JoinHandle<()>,
+    stderr: &thread::JoinHandle<()>,
+    grace: Duration,
+) -> bool {
+    let until = Instant::now() + grace;
+    loop {
+        if stdin.is_finished() && stdout.is_finished() && stderr.is_finished() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +609,52 @@ mod tests {
         );
         assert_eq!(code, Some(0), "{err}");
         assert!(err.is_empty(), "{err}");
+    }
+
+    /// A Commander action that exits while a background descendant still holds
+    /// its stdout must complete promptly with the child's real exit status and
+    /// the output captured so far, and must leave that descendant running.
+    #[cfg(unix)]
+    #[test]
+    fn async_action_completes_when_a_descendant_keeps_output_open() {
+        let dir =
+            std::env::temp_dir().join(format!("luvus-drain-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("bg.pid");
+        let script = format!(
+            "sleep 30 & echo $! > '{}'; printf ready",
+            pid_file.display()
+        );
+        let started = std::time::Instant::now();
+        let (code, out, err) = run_with_input(
+            &dir,
+            &["/bin/sh".into(), "-c".into(), script],
+            &[],
+            Some(br#"{"version":1}"#.to_vec()),
+            None,
+            None,
+            true,
+        );
+        let elapsed = started.elapsed();
+        let bg: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let still_running = unsafe { libc::kill(bg, 0) } == 0;
+        unsafe {
+            libc::kill(bg, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(elapsed < Duration::from_secs(10), "blocked for {elapsed:?}");
+        assert_eq!(code, Some(0), "the action itself succeeded: {err:?}");
+        assert_eq!(out, "ready");
+        assert!(err.contains("background process kept"), "{err:?}");
+        assert!(
+            still_running,
+            "a deliberately backgrounded process was killed"
+        );
     }
 
     #[cfg(unix)]

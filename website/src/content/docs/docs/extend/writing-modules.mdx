@@ -677,6 +677,13 @@ For pipes or `$VAR`, invoke a shell explicitly:
 3. stdout and stderr are captured (64 KiB each), the exit is recorded:
    `running` → `succeeded` / `failed`.
 
+A process your action starts in the background keeps running after the action
+exits. If it inherited stdout or stderr, luvus waits about 2 seconds for those
+streams to close, then records the action's own exit status with the output
+captured so far and a note that later output was not captured. Redirect a
+background process's output (for example `server >server.log 2>&1 &`) when you
+want the action to finish immediately.
+
 Caps: at most **32** module commands in flight, and the **200** most recent log
 entries are kept. Commands are isolated processes, so a crash or hang never
 takes down luvus.
