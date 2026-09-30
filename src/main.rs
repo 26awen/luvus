@@ -2838,11 +2838,32 @@ mod tests {
         };
 
         // Right-click the first workspace → its context menu opens.
+        app.workspaces[0].branch = Some("feature/demo".into());
         render(&mut app);
         let row = ws_row(&app);
         mouse(&mut app, MouseButton::Right, row.x + 1, row.y);
         assert!(app.ws_menu.is_some(), "right-click opens the menu");
         render(&mut app); // populates item rects
+
+        // The copy rows live one level down. Hovering the Quick Actions row opens
+        // its submenu, which lists Copy Path then Copy Branch.
+        let parent = item_rect(&app, WsMenuItem::QuickActions);
+        app.hover = Some((parent.x + 1, parent.y));
+        render(&mut app);
+        let quick: Vec<WsMenuItem> = app
+            .ws_menu
+            .as_ref()
+            .expect("menu open")
+            .quick_rects
+            .iter()
+            .map(|(item, _)| *item)
+            .collect();
+        assert_eq!(
+            quick,
+            vec![WsMenuItem::CopyPath, WsMenuItem::CopyBranch],
+            "Quick Actions lists Copy Path then Copy Branch"
+        );
+        app.hover = None;
 
         // Pick Rename → the modal opens pre-filled with the current label.
         let rn = item_rect(&app, WsMenuItem::Rename);
