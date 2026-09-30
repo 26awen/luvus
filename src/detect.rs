@@ -1150,12 +1150,49 @@ fn claude_live_screen(screen: &str) -> Option<&str> {
     let rail = (0..lines.len().saturating_sub(1))
         .rev()
         .find(|&i| is_rail(lines[i]) && is_prompt(lines[i + 1]))?;
-    let start = (0..rail)
-        .rev()
-        .find(|&i| lines[i].starts_with(CLAUDE_STATUS_GLYPHS))
-        .unwrap_or(rail);
+    // Claude's status block is its status line followed only by indented
+    // detail (tips, to-dos). A column-0 line nearer the input box is
+    // conversation, so nothing above it can be the live status line.
+    let mut start = rail;
+    for i in (0..rail).rev() {
+        let line = lines[i];
+        if is_claude_status_line(line) {
+            start = i;
+            break;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            break;
+        }
+    }
     let offset: usize = lines[..start].iter().map(|line| line.len() + 1).sum();
     screen.get(offset..)
+}
+
+/// Whether `line` has the shape of Claude's status line: a status or braille
+/// spinner glyph and a space, then either a busy verb with an ellipsis
+/// (`✢ Inferring… (12s …)`, `⠹ Thinking… (esc to interrupt)`) or a finished
+/// turn (`✻ Worked for 11s · done 7:27 AM`). A conversation line that merely
+/// starts with `*` or `·`, like `* Esc to cancel`, is neither.
+fn is_claude_status_line(line: &str) -> bool {
+    let mut chars = line.trim_start().chars();
+    if !chars
+        .next()
+        .is_some_and(|c| CLAUDE_STATUS_GLYPHS.contains(&c) || is_spinner_glyph(c))
+        || chars.next() != Some(' ')
+    {
+        return false;
+    }
+    let mut words = chars.as_str().split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let busy = first.ends_with('…');
+    let done = first.chars().all(char::is_alphabetic)
+        && words.next() == Some("for")
+        && words
+            .next()
+            .is_some_and(|time| time.starts_with(|c: char| c.is_ascii_digit()));
+    busy || done
 }
 
 /// Classify a pane from its title, bottom-buffer text, whether it produced
@@ -2758,9 +2795,10 @@ Would you like to proceed?
         let transcript =
             "⏺ Bash(echo 'Enter to select · Esc to cancel')\n  ⎿  Enter to select · Esc to cancel";
         for status in [
-            "✢ Inferring… (12s · ↓ 3.2k tokens)", // current builds: token counter
+            "⠹ Thinking… (esc to interrupt)",        // braille spinner builds
+            "✢ Inferring… (12s · ↓ 3.2k tokens)",    // current builds: token counter
             "✳ Cogitating… (4s · esc to interrupt)", // older builds: interrupt hint
-            "◐ Thinking… (3s)",                   // half-circle spinner builds
+            "◐ Thinking… (3s)",                      // half-circle spinner builds
         ] {
             let screen =
                 format!("{transcript}\n{status}\n  ⎿  Tip: press ? for shortcuts\n{prompt}");
@@ -2799,6 +2837,42 @@ Would you like to proceed?
             claude_detection(screen, "✳ Claude Code", None).state,
             State::Blocked
         );
+    }
+
+    /// A conversation line that only starts with a status glyph is not the
+    /// live status line (#465 review): `* Esc to cancel` must not read as a
+    /// working hint when Claude shows no status line.
+    #[test]
+    fn a_glyph_led_conversation_line_is_not_claude_status() {
+        let prompt = "────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)";
+        for old in [
+            "* Esc to cancel",
+            "· Esc to cancel",
+            "✻ esc to cancel",
+            "* Worked on esc to cancel",
+        ] {
+            let screen = format!("{old}\n{prompt}");
+            let detection = claude_detection(&screen, "✳ Claude Code", Some(true));
+            assert_eq!(detection.state, State::Idle, "{old}");
+            // Even a real-looking status line is ignored when conversation
+            // (a column-0 entry) sits between it and the input box.
+            let screen = format!("✢ Inferring… (esc to interrupt)\n⏺ Done.\n{prompt}");
+            assert_eq!(
+                claude_detection(&screen, "✳ Claude Code", Some(true)).state,
+                State::Idle
+            );
+        }
+        for status in [
+            "✻ Worked for 11s · done 7:27 AM",
+            "✻ Cooked for 6s · done 12:25 PM",
+            "✢ Inferring… (12s · ↓ 3.2k tokens)",
+            "· Pondering… (6s · esc to interrupt)",
+            "⠹ Thinking… (esc to interrupt)",
+            "  ✢ Inferring… (2s)",
+            "◐ Thinking… (3s)",
+        ] {
+            assert!(is_claude_status_line(status), "{status}");
+        }
     }
 
     #[test]
