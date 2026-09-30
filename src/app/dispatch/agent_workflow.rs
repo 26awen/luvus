@@ -528,14 +528,22 @@ impl App {
         } else {
             engine.detection_text(rows)
         };
-        let raw =
-            detect::prompt_evidence(engine.title().as_deref(), &bottom, agent, &self.manifests);
+        let composer = positive_evidence_required
+            .then(|| {
+                detect::live_composer_ready(agent, &*engine, status.claude_prompt_semantic_ready)
+            })
+            .flatten();
+        let raw = detect::prompt_evidence_with_composer(
+            engine.title().as_deref(),
+            &bottom,
+            agent,
+            &self.manifests,
+            composer,
+        );
         let evidence = if raw == detect::PromptEvidence::Blocked {
             raw
         } else if positive_evidence_required {
-            if detect::live_composer_ready(agent, &*engine, status.claude_prompt_semantic_ready)
-                == Some(true)
-            {
+            if composer == Some(true) {
                 detect::PromptEvidence::Ready
             } else {
                 detect::PromptEvidence::Unknown

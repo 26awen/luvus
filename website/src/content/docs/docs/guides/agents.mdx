@@ -401,6 +401,14 @@ around 100 to 200. Give a rule a higher number than the built-in you want it to
 beat. A file that fails to parse is skipped with a warning, so a typo never
 takes detection down.
 
+For Claude Code, luvus first checks whether its live input box is on screen.
+While it is, Claude cannot be showing a menu, because its menus and approval
+prompts replace the input box. In that case `blocked` screen rules are skipped,
+and other screen rules see only Claude's status line, its input box, and the
+rows below it. Earlier conversation text, such as a diff or a relayed message
+that contains "Enter to select · Esc to cancel", therefore never changes the
+state. Title rules still apply as usual.
+
 ## Agents can drive luvus
 
 Inside every pane, luvus injects `$LUVUS_PANE_ID` and `$LUVUS_SOCKET_PATH`, so
