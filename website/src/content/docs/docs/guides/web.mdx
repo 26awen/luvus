@@ -50,7 +50,9 @@ luvus web --control --port 0 --no-open
 
 Press Ctrl+C in the terminal that started the bridge to stop web access. Luvus
 revokes that bridge's temporary authority, while its server, panes, TUI clients,
-and named sessions keep running.
+and named sessions keep running. Stopping the bridge any other ordinary way,
+such as with `kill`, a service manager, or by closing its terminal, does the
+same.
 
 ## Open a named session
 
