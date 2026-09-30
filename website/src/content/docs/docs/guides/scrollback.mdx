@@ -91,6 +91,11 @@ that escape sequence does not acknowledge whether the clipboard changed.
 Soft-wrapped display rows copy as one logical line. Hard line breaks and any
 leading indentation inside the selection remain unchanged.
 
+Many agents and other full-screen applications turn on terminal mouse
+reporting. Inside such a pane, a plain drag belongs to the application, so
+Luvus does not select or copy it. Hold `Shift` while dragging to select with
+Luvus instead. A right-click always opens the Luvus pane menu.
+
 Clipboard helpers run on the **client machine**, including when attached over
 SSH. On Linux, the client uses `wl-copy` when `WAYLAND_DISPLAY` is set and
 X11 helpers when `DISPLAY` is set. It preserves the client's display environment,
