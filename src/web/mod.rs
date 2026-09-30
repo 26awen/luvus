@@ -127,13 +127,57 @@ async fn run(session: String, options: Options) -> Result<()> {
     }
 
     axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_requested())
         .await
         .context("Luvus Web server failed")?;
     drop(uhp);
     Ok(())
+}
+
+/// Resolve when the bridge is asked to stop. Ctrl+C is the usual way, but a
+/// service manager or `kill` sends SIGTERM and a closed terminal sends SIGHUP.
+/// Handling those too lets every stop take the graceful path above, which
+/// drops the `uhp access` helper instead of leaving it running on its own.
+async fn shutdown_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            (Ok(mut terminate), Ok(mut hangup)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                    _ = hangup.recv() => {}
+                }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close};
+        match (ctrl_break(), ctrl_close()) {
+            (Ok(mut brk), Ok(mut close)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = brk.recv() => {}
+                    _ = close.recv() => {}
+                }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Handle what the operator types into the terminal running the bridge: Enter
