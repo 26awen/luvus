@@ -1594,10 +1594,16 @@ impl App {
                     }
                     return true;
                 }
+                MouseEventKind::Down(button) if button == g.button => {
+                    // Held-button motion arrives as `Drag`, so a new press of
+                    // the grabbed button means the terminal dropped its release.
+                    // Finish the stale gesture for the child, then route this
+                    // press normally so the click is not lost.
+                    self.mouse_grab = None;
+                    self.send_grabbed_mouse(g, MouseSeq::Release, m.column, m.row);
+                }
                 MouseEventKind::Down(button) => {
-                    if button != g.button {
-                        self.suppressed_mouse_buttons |= mouse_button_bit(button);
-                    }
+                    self.suppressed_mouse_buttons |= mouse_button_bit(button);
                     return true;
                 }
                 _ => {}
@@ -10877,6 +10883,70 @@ mod link_click_tests {
         assert!(
             app.mouse_grab.is_none(),
             "the search-cancelling click is swallowed"
+        );
+    }
+
+    /// A terminal can drop a release. The next press of the same button then
+    /// closes the stale gesture for the child and starts a new one, instead of
+    /// being swallowed as part of the old gesture.
+    #[test]
+    fn a_press_after_a_dropped_release_starts_a_new_gesture() {
+        let _env = crate::persist::test_env("grab-dropped-release");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        enable_mouse_tracking(&app, pane);
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+        let sent = || {
+            let mut all = Vec::new();
+            while let Ok(crate::terminal::pty::InputAction::Bytes(bytes)) = input_rx.try_recv() {
+                all.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            all
+        };
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Middle),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        let first = sent();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].ends_with('M'), "press: {first:?}");
+
+        // The release never arrives; the same button is pressed again.
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Middle),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        let second = sent();
+        assert_eq!(
+            second.len(),
+            2,
+            "stale release, then the new press: {second:?}"
+        );
+        assert!(second[0].ends_with('m') && second[1].ends_with('M'));
+        assert_eq!(app.mouse_grab.map(|g| g.button), Some(MouseButton::Middle));
+
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Middle),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.mouse_grab.is_none());
+        let last = sent();
+        assert_eq!(last.len(), 1);
+        assert!(
+            last[0].ends_with('m'),
+            "the new gesture's release: {last:?}"
         );
     }
 
