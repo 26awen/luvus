@@ -111,6 +111,15 @@ fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("__automation-worker") {
         std::process::exit(automation::run_worker(&args)?);
     }
+    // A short-lived Unix launcher owns startup cleanup, then exits so a ready
+    // server is no longer a descendant of the client that started it.
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("__server-launch-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal server launch invocation"));
+        }
+        return session::run_server_launch_helper().map_err(Into::into);
+    }
     // A server restart initiated inside one of its panes cannot synchronously
     // survive that server closing the pane's PTY. `restart_session_via_helper`
     // launches this private route in a detached process group first.
@@ -986,50 +995,63 @@ fn server_running(sock: &Path) -> bool {
     ipc::transport::endpoint_exists(sock, Duration::from_millis(50))
 }
 
+#[cfg(unix)]
 fn spawn_server() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("server")
-        // The selector was already resolved into LUVUS_SESSION. A parent pane's
-        // injected API socket must not leak into a newly spawned server.
+    session::spawn_session_server(session::active_name().as_deref()).map_err(anyhow::Error::msg)
+}
+
+#[cfg(windows)]
+fn spawn_server() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("server")
         .env_remove("LUVUS_SOCKET_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Detach so the server survives the client exiting.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, own group.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
-    }
-    cmd.spawn()?;
+        .stderr(Stdio::null())
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — preserve Windows launch.
+        .creation_flags(0x0000_0008 | 0x0000_0200);
+    command.spawn()?;
     Ok(())
 }
 
 fn wait_for_socket(sock: &Path) -> Result<()> {
-    for _ in 0..100 {
+    wait_for_socket_with_timeout(sock, Duration::from_secs(5))
+}
+
+/// Bound startup readiness without stopping a server that may still restore.
+fn wait_for_socket_with_timeout(sock: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if server_running(sock) {
+            #[cfg(unix)]
+            if server_version_with_timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+            #[cfg(windows)]
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
-    Err(anyhow!("luvus server did not start in time"))
+    Err(anyhow!(
+        "luvus server did not become ready in time; it may still be starting, retry when ready"
+    ))
 }
 
 /// `luvus server <start|stop|restart|status>` — manage the background server.
 /// Bare `luvus server` (no subcommand) is the internal headless role that
-/// `spawn_server` launches via setsid; users go through the subcommands.
+/// `spawn_server` launches via the detached launcher; users use subcommands.
 fn server_cmd(args: &[String]) -> Result<()> {
     let Some(command) = args.get(2).map(String::as_str) else {
         return ipc::server::run(); // internal role: run the server in the foreground
@@ -1158,6 +1180,8 @@ fn update_manifest(context: i18n::cli::Context) -> Result<()> {
 fn server_start(context: i18n::cli::Context) -> Result<()> {
     let sock = persist::client_socket_path();
     if server_running(&sock) {
+        #[cfg(unix)]
+        wait_for_socket(&sock)?;
         print_server_card(context, context.text("running"), None, &sock);
         return Ok(());
     }
@@ -1894,6 +1918,28 @@ mod tests {
         assert!(
             result.is_err(),
             "fail closed rather than attach to a mute loop: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_wait_rejects_bound_endpoints_without_an_app_response() {
+        let _env = crate::persist::test_env("startup-mute-accept");
+        crate::persist::ensure_session_dir();
+        let client = crate::persist::client_socket_path();
+        let api = crate::persist::socket_path();
+        let _client_listener = crate::ipc::transport::bind(&client).unwrap();
+        let _api_listener = crate::ipc::transport::bind(&api).unwrap();
+        let started = Instant::now();
+        let result = wait_for_socket_with_timeout(&client, Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("did not become ready"));
+        assert!(
+            server_running(&client),
+            "readiness timeout must not stop the server"
         );
     }
 
