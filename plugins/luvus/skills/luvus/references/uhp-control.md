@@ -207,6 +207,13 @@ prompt. Other agents retain the permissive Unknown-evidence fallback when
 strict is omitted. Inspect the visible screen and use `agent.keys` only for an
 explicitly authorized interaction.
 
+`agent.list` rows and `agent.get` include `agent_session_title`: the agent's
+live conversation title, or `null`. Use it to describe an agent to the user,
+never to target one; titles repeat and change. `name` keeps its meaning as the
+presentation label (a backend label when one exists, otherwise the operator
+alias), so target by pane ID, `terminal_id`, or an alias you set, not by
+`name`. `session` is still the native session ID. Older servers omit the field.
+
 For UHP prompt calls that must reach the same PTY after a possible restart,
 pass the `terminal_id` from `agent.read` or `agent.list` to `agent.prompt` or
 `agent.send`. A mismatch returns `content_revision_conflict` before input is
