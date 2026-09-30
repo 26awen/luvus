@@ -1909,6 +1909,9 @@ pub struct PaneStatus {
     /// while still evaluating activity and quiet-dwell deadlines.
     detected_title: Option<Arc<str>>,
     detected_bottom: Arc<str>,
+    /// The live input-box probe taken with `detected_bottom`, for agents that
+    /// have one. Reused with it so an unchanged frame classifies the same way.
+    detected_composer_ready: Option<bool>,
     /// Process identity, resize, manifest, and session changes force one fresh
     /// terminal inspection even when no new PTY bytes arrived.
     pub(crate) force_detect: bool,
@@ -1959,6 +1962,7 @@ impl PaneStatus {
             last_detect_generation: None,
             detected_title: None,
             detected_bottom: Arc::from(""),
+            detected_composer_ready: None,
             force_detect: true,
             blocked_hint: None,
             prompt_evidence: detect::PromptEvidence::Unknown,

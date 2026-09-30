@@ -674,7 +674,7 @@ impl App {
                 .as_ref()
                 .and_then(|(_, _, _, composer_ready)| *composer_ready);
             if let Some(s) = self.status.get_mut(&id) {
-                if let Some((generation, title, bottom, _)) = inspected {
+                if let Some((generation, title, bottom, composer_ready)) = inspected {
                     if audit_only {
                         self.detection_audit_recoveries =
                             self.detection_audit_recoveries.saturating_add(1);
@@ -683,17 +683,24 @@ impl App {
                     presentation_metadata_changed |= s.detected_title != title;
                     s.detected_title = title;
                     s.detected_bottom = bottom;
+                    s.detected_composer_ready = composer_ready;
                     s.force_detect = false;
                     self.detection_extractions = self.detection_extractions.saturating_add(1);
                 } else {
                     self.detection_skips = self.detection_skips.saturating_add(1);
                 }
             }
-            let (title, bottom) = self
+            let (title, bottom, detected_composer_ready) = self
                 .status
                 .get(&id)
-                .map(|s| (s.detected_title.clone(), s.detected_bottom.clone()))
-                .unwrap_or_else(|| (None, Arc::from("")));
+                .map(|s| {
+                    (
+                        s.detected_title.clone(),
+                        s.detected_bottom.clone(),
+                        s.detected_composer_ready,
+                    )
+                })
+                .unwrap_or_else(|| (None, Arc::from(""), None));
             let base = pane.command.as_str();
             let recent = self
                 .status
@@ -727,7 +734,7 @@ impl App {
                     rule_priority: None,
                     rule_region: None,
                 },
-                None => detect::classify(
+                None => detect::classify_with_composer(
                     title.as_deref(),
                     &bottom,
                     recent,
@@ -736,6 +743,10 @@ impl App {
                     known,
                     running,
                     &self.manifests,
+                    // Only Claude's own probe can vouch for Claude's screen.
+                    composer_agent
+                        .filter(|agent| agent.eq_ignore_ascii_case("claude"))
+                        .and(detected_composer_ready),
                 ),
             };
 
