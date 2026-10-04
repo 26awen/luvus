@@ -173,6 +173,17 @@ def valid_control_frame(value):
     if action in {"upload_finish", "upload_cancel"}:
         upload_id = params.get("upload_id")
         return set(params) == {"upload_id"} and isinstance(upload_id, str) and OPAQUE.fullmatch(upload_id) is not None
+    if action == "set_viewport":
+        cols, rows = params.get("cols"), params.get("rows")
+        return (
+            set(params) == {"cols", "rows"}
+            and isinstance(cols, int)
+            and not isinstance(cols, bool)
+            and 2 <= cols <= 500
+            and isinstance(rows, int)
+            and not isinstance(rows, bool)
+            and 2 <= rows <= 300
+        )
     return action == "send_key" and set(params) == {"key"} and params.get("key") in KEYS
 
 

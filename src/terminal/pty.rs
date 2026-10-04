@@ -875,6 +875,12 @@ impl Pane {
         self.content_revision.load(Ordering::Acquire)
     }
 
+    /// Record that the captured text changed without new child output, as
+    /// after a reflow, so revision-driven readers take a fresh capture.
+    pub fn note_reflow(&self) {
+        self.content_revision.fetch_add(1, Ordering::Release);
+    }
+
     pub fn content_revision_handle(&self) -> Arc<AtomicU64> {
         self.content_revision.clone()
     }

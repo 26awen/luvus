@@ -826,6 +826,19 @@ fn valid_terminal_control_frame(frame: &str) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(crate::terminal::backend::valid_id)
             }
+            Some("set_viewport") => {
+                params.len() == 2
+                    && crate::terminal::backend::viewport_dimension(
+                        params.get("cols"),
+                        crate::terminal::backend::MAX_VIEWPORT_COLS,
+                    )
+                    .is_some()
+                    && crate::terminal::backend::viewport_dimension(
+                        params.get("rows"),
+                        crate::terminal::backend::MAX_VIEWPORT_ROWS,
+                    )
+                    .is_some()
+            }
             Some("send_key") => {
                 params.len() == 1
                     && params
@@ -1242,6 +1255,18 @@ mod tests {
         ));
         assert!(valid_terminal_control_frame(
             r#"{"id":"key-3","action":"send_key","params":{"key":"alt-d"}}"#
+        ));
+        assert!(valid_terminal_control_frame(
+            r#"{"id":"size-1","action":"set_viewport","params":{"cols":40,"rows":18}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-2","action":"set_viewport","params":{"cols":1,"rows":18}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-3","action":"set_viewport","params":{"cols":40,"rows":18,"pane_id":"7"}}"#
+        ));
+        assert!(!valid_terminal_control_frame(
+            r#"{"id":"size-4","action":"set_viewport","params":{"cols":"40","rows":18}}"#
         ));
         assert!(!valid_terminal_control_frame(
             r#"{"id":"run-1","action":"pane.run","params":{"text":"id"}}"#

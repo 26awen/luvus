@@ -43,7 +43,7 @@ For a control stream, also check each exact action name in
 `terminal.capabilities`. Do not infer action support from `control_stream`, the
 protocol version, or a Luvus release number. For example, file attachment
 requires `upload_start`, `upload_chunk`, `upload_finish`, and `upload_cancel`;
-image paste requires `paste_image`.
+image paste requires `paste_image`; sizing a terminal requires `set_viewport`.
 
 ## Identity and lifecycle
 
@@ -165,6 +165,22 @@ action frames after its acknowledgment:
 Actions reuse ordinary strict UHP validation and replies. Only one
 API control stream can lease a terminal at a time. Observe streams remain
 read-only, and local owner/TUI authority is unchanged.
+
+When `terminal.capabilities` includes `set_viewport`, a control stream can ask
+for the terminal's size:
+
+```json
+{"id":"size-1","action":"set_viewport","params":{"cols":40,"rows":18}}
+```
+
+`cols` and `rows` are bounded by the `viewport_cols` and `viewport_rows` limits.
+The request applies only while no native client is rendering, for example on a
+detached server whose panes would otherwise keep their last size. While any
+native client is rendering, the reply is `unavailable` with dispatch `rejected`
+and the PTY is untouched, so a browser never competes with an attached TUI for
+geometry. A native client that attaches later lays the pane out again. After a
+successful resize the stream sends a replacement frame at the new size, even
+when the child prints nothing. Observe streams cannot set a viewport.
 
 For native command-line editing, `send_key` includes `ctrl-w` and `alt-d` for
 backward and forward word deletion, and `ctrl-u` and `ctrl-k` for deletion

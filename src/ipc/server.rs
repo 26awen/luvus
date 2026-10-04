@@ -1210,6 +1210,13 @@ fn apply(
                 .map(|state| crate::app::Sidebars::from_config(&state.layout));
             changed
         }
+        // A control stream may size its terminal only while no native client is
+        // rendering. Any rendering client keeps geometry authority, exactly as
+        // the foreground client does over background ones.
+        AppEvent::BackendViewport { params, reply } => {
+            let _ = reply.send(app.backend_set_viewport(&params, has_render_clients(clients)));
+            false
+        }
         // Redraw only if the event actually changed the UI — a plain keystroke
         // forwarded to a pane does not (its echo arrives as a separate `PtyData`).
         other => app.handle_event(other),
@@ -3963,6 +3970,57 @@ mod tests {
             (content.width, content.height),
             "secondary projection must not resize the shared PTY"
         );
+    }
+
+    #[test]
+    fn api_viewport_applies_only_while_no_client_renders() {
+        let _env = crate::persist::test_env("api-viewport-gate");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(120, 40, app_tx).expect("app starts");
+        app.server_mode = true;
+        let pane = app.layout().focus;
+        let runtime = app.panes[&pane].terminal_runtime().expect("runtime");
+        let params = serde_json::json!({
+            "server_generation":app.backend_server_generation,
+            "terminal_id":runtime.terminal_id,
+            "pane_id":pane.0.to_string(),
+            "cols":40,
+            "rows":18,
+        });
+        let native_size = app.panes[&pane].size();
+        let (client, _client_rx) = display_client(120, 40, 1);
+        let mut clients = HashMap::from([(1, client)]);
+        let mut foreground = Some(1);
+        let mut interactive_size = (120, 40);
+        let mut next_activity = 2;
+        let mut request = |app: &mut App, clients: &mut HashMap<u64, ClientState>| {
+            let (reply, result) = mpsc::channel();
+            assert!(!apply(
+                AppEvent::BackendViewport {
+                    params: params.clone(),
+                    reply,
+                },
+                app,
+                clients,
+                &mut foreground,
+                &mut interactive_size,
+                &mut next_activity,
+            ));
+            result.recv().expect("viewport reply")
+        };
+
+        let refused = request(&mut app, &mut clients).expect_err("native client owns geometry");
+        assert_eq!(refused.code, "unavailable");
+        assert_eq!(app.panes[&pane].size(), native_size);
+
+        // A suspended endpoint renders nothing, so it holds no geometry.
+        clients.get_mut(&1).unwrap().interest = SurfaceInterest::Suspended;
+        request(&mut app, &mut clients).expect("suspended clients do not block a viewport");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+
+        clients.clear();
+        request(&mut app, &mut clients).expect("a detached server accepts a viewport");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
     }
 
     #[test]

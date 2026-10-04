@@ -22,6 +22,7 @@ const METHOD_PATTERN = /^[a-z][a-z0-9_.]{0,127}$/;
 const TERMINAL_ACTIONS = new Set([
   "type_literal", "paste_text", "paste_image", "submit_text", "send_key",
   "upload_start", "upload_chunk", "upload_finish", "upload_cancel",
+  "set_viewport",
 ]);
 
 type ClientState = {

@@ -612,6 +612,12 @@ impl App {
                 let _ = reply.send(self.prepare_backend_observe(&params));
                 return false;
             }
+            // Reached only without a server loop: this process is the native
+            // client, and it owns terminal geometry.
+            AppEvent::BackendViewport { params, reply } => {
+                let _ = reply.send(self.backend_set_viewport(&params, true));
+                return false;
+            }
             AppEvent::ThemeUninstalled { id, result } => {
                 self.finish_theme_uninstall(id, result);
                 return true;
@@ -1422,6 +1428,7 @@ impl App {
             | AppEvent::BackendCreateReady { .. }
             | AppEvent::BackendCreatePreflight { .. }
             | AppEvent::BackendObserve { .. }
+            | AppEvent::BackendViewport { .. }
             | AppEvent::PtyReady { .. }
             | AppEvent::SearchFilesIndexed { .. }
             | AppEvent::SearchResults { .. }

@@ -82,6 +82,13 @@ pub enum AppEvent {
             Result<crate::terminal::backend::ObserveTarget, crate::terminal::backend::BackendError>,
         >,
     },
+    /// Size one terminal for an API control stream. The server loop answers it
+    /// with its client set in hand, so native render clients keep geometry
+    /// authority; a local single-process UI always refuses.
+    BackendViewport {
+        params: serde_json::Value,
+        reply: Sender<Result<serde_json::Value, crate::terminal::backend::BackendError>>,
+    },
     /// A binary client attached (server mode); `messages` feeds its socket writer.
     ClientConnected {
         id: u64,

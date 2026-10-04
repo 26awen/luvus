@@ -4,7 +4,7 @@
   "type":"object",
   "properties":{
     "id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9._:-]+$"},
-    "action":{"enum":["type_literal","paste_text","paste_image","submit_text","send_key","upload_start","upload_chunk","upload_finish","upload_cancel"]},
+    "action":{"enum":["type_literal","paste_text","paste_image","submit_text","send_key","upload_start","upload_chunk","upload_finish","upload_cancel","set_viewport"]},
     "params":{"type":"object"}
   },
   "required":["id","action","params"],
@@ -44,6 +44,12 @@
       "properties":{
         "action":{"enum":["upload_finish","upload_cancel"]},
         "params":{"type":"object","properties":{"upload_id":{"type":"string","pattern":"^[0-9a-f]{32}$"}},"required":["upload_id"],"additionalProperties":false}
+      }
+    },
+    {
+      "properties":{
+        "action":{"const":"set_viewport"},
+        "params":{"type":"object","properties":{"cols":{"type":"integer","minimum":2,"maximum":500},"rows":{"type":"integer","minimum":2,"maximum":300}},"required":["cols","rows"],"additionalProperties":false}
       }
     },
     {

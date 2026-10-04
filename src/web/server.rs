@@ -1043,6 +1043,7 @@ fn terminal_action(action: &str) -> bool {
             | "upload_chunk"
             | "upload_finish"
             | "upload_cancel"
+            | "set_viewport"
     )
 }
 
