@@ -5,6 +5,7 @@ import { accessProblem, pairingCredential, parsePairingInput, type SentCredentia
 import { pairingQrDataUrl } from "./pairing-qr.js";
 import { RenderScheduler } from "./render-scheduler.js";
 import { supportsFileUpload } from "./terminal-capabilities.js";
+import { viewportSizingAvailable } from "./terminal-viewport.js";
 import { terminalPaneOptions, type TerminalPaneOption } from "./terminal-pane-options.js";
 import { TerminalView } from "./terminal-view.js";
 import { markFieldSaved, rebuildPreservingView } from "./view-state.js";
@@ -677,6 +678,7 @@ export class WebApp {
     const canUploadFiles = control && supportsFileUpload(
       this.#session.capabilities?.terminal?.capabilities,
     );
+    const viewportSizing = viewportSizingAvailable(this.#session.capabilities?.terminal?.capabilities, control);
     const terminal = new TerminalView(
       this.#bridge,
       snapshot,
@@ -684,6 +686,7 @@ export class WebApp {
       control,
       canUploadFiles,
       streamCursor,
+      viewportSizing,
       () => this.#terminalPaneOptions(),
       (selectedPane) => {
         const currentSnapshot = this.#session.snapshot;

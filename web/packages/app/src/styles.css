@@ -304,6 +304,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   font-size: .9rem; line-height: 1.5;
 }
 .terminal-no-wrap .terminal-output { white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+.terminal-cell-probe { position: absolute; visibility: hidden; white-space: pre; pointer-events: none; }
 .terminal-output:focus-visible { box-shadow: inset 0 0 0 1px #ead77855; }
 .terminal-output::-webkit-scrollbar { display: none; }
 .terminal-status { margin-top: 1rem; padding: .65rem .8rem; color: #ffe4e8; background: #4b252d; border-radius: .65rem; }

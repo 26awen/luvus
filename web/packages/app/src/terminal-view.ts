@@ -5,6 +5,7 @@ import { NativeTerminalInput, type TerminalAction } from "./native-input.js";
 import { terminalPaneLabel, type TerminalPaneOption } from "./terminal-pane-options.js";
 import { captureTerminalScroll, restoreTerminalScroll, terminalFrameParts, updateTerminalFrame } from "./terminal-output.js";
 import { TerminalTargetTracker, type TerminalTarget } from "./terminal-target.js";
+import { sameViewport, terminalViewportFor, type TerminalViewport } from "./terminal-viewport.js";
 
 export class TerminalView {
   readonly root = element("section", { className: "terminal-screen" });
@@ -37,7 +38,14 @@ export class TerminalView {
   #uploadTail: Promise<void> = Promise.resolve();
   #followTail = true;
   #viewportFrame: number | undefined;
-  #viewportChanged = () => this.#syncViewport();
+  #viewportChanged = () => {
+    this.#syncViewport();
+    this.#scheduleViewport();
+  };
+  // One measured cell; the server is asked for the size that fits the output area.
+  #cellProbe = element("span", { className: "terminal-cell-probe", attrs: { "aria-hidden": "true" }, text: "0000000000" });
+  #lastViewport: TerminalViewport | undefined;
+  #viewportTimer: ReturnType<typeof setTimeout> | undefined;
   #paneMenu = element("div", {
     className: "terminal-pane-menu",
     attrs: { role: "menu", "aria-label": "Switch terminal pane", hidden: "" },
@@ -61,6 +69,7 @@ export class TerminalView {
     private readonly control: boolean,
     private readonly canUploadFiles: boolean,
     private readonly streamCursor: boolean,
+    private readonly viewportSizing: boolean,
     private readonly paneOptions: () => TerminalPaneOption[],
     private readonly onSelectPane: (pane: PaneSnapshot) => void,
     onBack: () => void,
@@ -75,6 +84,7 @@ export class TerminalView {
           if (this.canUploadFiles) this.#queueFiles(files);
         },
       );
+      this.#input.element.addEventListener("focus", () => this.#scheduleViewport(true));
       this.#input.element.addEventListener("focus", () => {
         this.#inputHint.textContent = "Typing in terminal";
         this.root.classList.add("keyboard-active");
@@ -200,6 +210,7 @@ export class TerminalView {
       fileInput,
       ...(this.#input ? [this.#input.element] : []),
     );
+    this.#output.append(this.#cellProbe);
     this.#output.addEventListener("scroll", () => {
       const distance = this.#output.scrollHeight - this.#output.scrollTop - this.#output.clientHeight;
       this.#followTail = distance < 80;
@@ -249,6 +260,8 @@ export class TerminalView {
       this.#clearStatus();
       this.#restoreInputHint();
       this.#flushQueuedActions(stream);
+      this.#lastViewport = undefined;
+      this.#scheduleViewport(true);
     } catch (error) {
       if (this.#destroyed || attempt !== this.#streamAttempt) return;
       this.#stream = undefined;
@@ -274,6 +287,7 @@ export class TerminalView {
     this.#stream = undefined;
     if (this.#paintFrame !== undefined) cancelAnimationFrame(this.#paintFrame);
     if (this.#viewportFrame !== undefined) cancelAnimationFrame(this.#viewportFrame);
+    if (this.#viewportTimer !== undefined) clearTimeout(this.#viewportTimer);
     window.visualViewport?.removeEventListener("resize", this.#viewportChanged);
     window.visualViewport?.removeEventListener("scroll", this.#viewportChanged);
     window.removeEventListener("resize", this.#viewportChanged);
@@ -531,6 +545,40 @@ export class TerminalView {
     this.root.style.setProperty("--terminal-viewport-top", `${top}px`);
     if ((!revealInput && !this.root.classList.contains("keyboard-active")) || !this.#followTail) return;
     this.#scrollToLatest();
+  }
+
+  // Ask once the layout has settled: resizes and keyboard changes arrive in bursts.
+  #scheduleViewport(force = false): void {
+    if (!this.viewportSizing || this.#destroyed) return;
+    if (this.#viewportTimer !== undefined) clearTimeout(this.#viewportTimer);
+    this.#viewportTimer = setTimeout(() => {
+      this.#viewportTimer = undefined;
+      void this.#requestViewport(force);
+    }, 150);
+  }
+
+  async #requestViewport(force: boolean): Promise<void> {
+    const stream = this.#stream;
+    if (!stream || this.#destroyed) return;
+    const style = getComputedStyle(this.#output);
+    const cell = this.#cellProbe.getBoundingClientRect();
+    const wanted = terminalViewportFor(
+      this.#output.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      this.#output.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+      cell.width / 10,
+      cell.height,
+    );
+    if (!wanted || (!force && sameViewport(wanted, this.#lastViewport))) return;
+    this.#lastViewport = wanted;
+    try {
+      // Sent straight to the stream: a refusal is not an input failure and must
+      // not queue, scroll, or reconnect anything.
+      await stream.action("set_viewport", { cols: wanted.cols, rows: wanted.rows });
+    } catch {
+      // A native client owns the size, or the stream went away. The frame is
+      // shown as served; the next connect, resize, or focus asks again.
+      this.#lastViewport = undefined;
+    }
   }
 
   #scrollToLatest(): void {
