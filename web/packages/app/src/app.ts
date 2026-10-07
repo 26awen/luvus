@@ -1,16 +1,17 @@
 import { BridgeClient, BridgeError, LiveSession, type PaneSnapshot, type SessionSnapshot } from "@luvus/uhp-client";
+import { BrowserTickets, TICKET_KEY } from "./browser-tickets.js";
 import { button, element } from "./dom.js";
-import { agentCardTitle, dashboardAgents, displayText } from "./dashboard-agents.js";
 import { accessProblem, pairingCredential, parsePairingInput, type SentCredential } from "./pairing.js";
 import { pairingQrDataUrl } from "./pairing-qr.js";
 import { RenderScheduler } from "./render-scheduler.js";
+import { navigationBrand, navigationDot, refreshButton, trapNavigationFocus, type SidebarControls } from "./sidebar-controls.js";
 import { supportsFileUpload } from "./terminal-capabilities.js";
 import { viewportSizingAvailable } from "./terminal-viewport.js";
-import { terminalPaneOptions, type TerminalPaneOption } from "./terminal-pane-options.js";
+import { filterWorkspacePanes, TerminalPaneRecency, TerminalWorkspaceSelection, terminalWorkspaceOptions, type TerminalPaneOption } from "./terminal-pane-options.js";
+import { TerminalPaneSidebar } from "./terminal-pane-sidebar.js";
+import { TerminalWorkspaceSidebar } from "./terminal-workspace-sidebar.js";
 import { TerminalView } from "./terminal-view.js";
 import { markFieldSaved, rebuildPreservingView } from "./view-state.js";
-
-const TICKET_KEY = "luvus.web.ticket";
 
 type DeviceStatus = {
   type: "browser_device_status";
@@ -49,15 +50,76 @@ export class WebApp {
   #sessionPanelOpen = false;
   #sessionLoading = false;
   #showShells = false;
+  readonly #paneRecency = new TerminalPaneRecency();
+  readonly #workspaceSelection = new TerminalWorkspaceSelection();
+  readonly #dashboardWorkspaces: TerminalWorkspaceSidebar;
+  readonly #dashboardPanes: TerminalPaneSidebar;
+  readonly #overlays = element("div", { className: "web-overlays" });
+  readonly #dashboardNavigation = element("div", { className: "terminal-navigation", attrs: { id: "dashboard-navigation", "aria-label": "Workspaces and panes" } });
+  #dashboardNavigationOpen = false;
+  readonly #dashboardOpenButton = navigationDot("Open navigation", "dashboard-navigation", () => this.#openDashboardNavigation());
+  readonly #dashboardCloseButton: HTMLButtonElement;
+  readonly #dashboardHeader: HTMLElement;
+  readonly #desktopSidebars = matchMedia("(min-width: 1024px)");
+  readonly #sidebarControls: SidebarControls = {
+    collapsed: { workspaces: false, panes: false },
+    toggle: (side) => {
+      this.#sidebarControls.collapsed[side] = !this.#sidebarControls.collapsed[side];
+      if (this.#terminal) this.#terminal.updateSidebarLayout();
+      else this.#render();
+    },
+    refresh: () => void this.#session.refresh().catch((error) => this.#showError(error)),
+    footer: () => this.#sidebarFooter(),
+  };
   /** This tab's own pairing code, from its link or pasted on the access screen. */
   #tabCode: string | undefined;
   /** What this tab last presented, so a rejection can be explained truthfully. */
   #sent: SentCredential = { ticket: false, code: false };
   #pairError: string | undefined;
+  readonly #tickets = new BrowserTickets();
+  #sentTicket: string | null = null;
   /** Redraws caused by live updates, as opposed to the person's own actions. */
   readonly #renders = new RenderScheduler(() => this.#renderNow());
 
   constructor(private readonly root: HTMLElement) {
+    const openPane = (pane: PaneSnapshot) => {
+      const snapshot = this.#session.snapshot;
+      if (snapshot) this.#openTerminal(snapshot, pane);
+    };
+    const overview = () => {
+      this.#closeDashboardNavigation(true);
+      this.root.querySelector<HTMLElement>(".dashboard")?.scrollTo({ top: 0, behavior: "smooth" });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    };
+    this.#dashboardWorkspaces = new TerminalWorkspaceSidebar(openPane, overview, () => this.#sidebarControls.toggle("workspaces"));
+    this.#dashboardPanes = new TerminalPaneSidebar(openPane, {
+      showShells: this.#showShells,
+      onChange: (showShells) => { this.#showShells = showShells; this.#render(); },
+    }, () => this.#closeDashboardNavigation(true), () => this.#sidebarControls.toggle("panes"));
+    this.#dashboardCloseButton = this.#dashboardPanes.closeButton;
+    this.#dashboardCloseButton.setAttribute("aria-label", "Close navigation");
+    this.#dashboardCloseButton.setAttribute("aria-controls", "dashboard-navigation");
+    this.#dashboardCloseButton.title = "Close navigation";
+    this.#dashboardOpenButton.setAttribute("aria-haspopup", "dialog");
+    this.#dashboardHeader = element("header", { className: "dashboard-header" }, navigationBrand(overview), this.#dashboardOpenButton);
+    this.#dashboardNavigation.append(
+      element("header", { className: "terminal-navigation-header" }, navigationBrand(overview), this.#dashboardCloseButton),
+      this.#dashboardWorkspaces.root, this.#dashboardPanes.root,
+    );
+    this.#desktopSidebars.addEventListener("change", () => {
+      if (this.#desktopSidebars.matches) this.#dashboardNavigationOpen = false;
+      this.#render();
+    });
+    document.addEventListener("keydown", (event) => {
+      const dialog = this.#devicePanelOpen ? this.#overlays.querySelector<HTMLElement>(".device-panel")
+        : !this.#terminal && this.#dashboardNavigationOpen ? this.#dashboardNavigation : undefined;
+      if (!dialog) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (this.#devicePanelOpen) this.#closeDevicePanel();
+        else this.#closeDashboardNavigation(true);
+      } else trapNavigationFocus(event, dialog);
+    });
     // Hold live redraws while a pointer is pressed, so the pressed element
     // is still there when it is released and the click is delivered.
     root.addEventListener("pointerdown", (event) => this.#renders.hold(event.pointerId), true);
@@ -76,11 +138,13 @@ export class WebApp {
     this.#tabCode = consumePairingFragment();
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     this.#bridge = new BridgeClient(`${scheme}//${location.host}/bridge`, () => {
-      const credential = pairingCredential(sessionStorage.getItem(TICKET_KEY), this.#tabCode);
+      this.#sentTicket = this.#tickets.get();
+      const credential = pairingCredential(this.#sentTicket, this.#tabCode);
       this.#sent = { ticket: Boolean(credential.ticket), code: Boolean(credential.code) };
       return credential;
     }, (ticket) => {
-      sessionStorage.setItem(TICKET_KEY, ticket);
+      this.#tickets.set(ticket);
+      this.#sentTicket = ticket;
       // The code was spent to issue this ticket.
       this.#tabCode = undefined;
     });
@@ -111,6 +175,15 @@ export class WebApp {
       this.#renders.request();
     });
     this.#session.addEventListener("titles", (event) => this.#updateTitles((event as CustomEvent<string[]>).detail));
+    window.addEventListener("storage", (event) => {
+      // Pairing or forgetting in another tab updates this tab too. Transient
+      // disconnects do not erase access, and there is no idle polling.
+      if ((event.key === TICKET_KEY || event.key === null) && this.#tickets.get() !== this.#sentTicket) {
+        // Replace the old connection and any in-flight synchronization as one
+        // lifecycle; late results from the old authority cannot restore its UI.
+        location.reload();
+      }
+    });
   }
 
   async start(): Promise<void> {
@@ -134,21 +207,35 @@ export class WebApp {
   }
 
   #renderNow(): void {
-    if (this.#terminal) return;
+    if (this.#terminal) {
+      this.#terminal.root.inert = this.#devicePanelOpen;
+      this.#updateConnectionStatus();
+      rebuildPreservingView(this.#overlays, () => this.#overlays.replaceChildren(...(this.#devicePanelOpen ? [this.#devicePanel()] : [])));
+      return;
+    }
     const snapshot = this.#session.snapshot;
     // Without authority nothing on the dashboard can act, so show the access
     // screen instead of a stale dashboard or a loading state that never ends.
     const expired = this.#session.state === "expired";
-    rebuildPreservingView(this.root, () => this.root.replaceChildren(
-      element("div", { className: "shell" },
-        expired
-          ? element("div", { className: "dashboard loading-dashboard" }, this.#accessScreen())
-          : snapshot
-            ? this.#dashboard(snapshot)
-            : element("div", { className: "dashboard loading-dashboard" }, this.#missionDock(false), this.#connecting()),
-        !expired && snapshot && this.#devicePanelOpen ? this.#devicePanel() : undefined,
-      ),
-    ));
+    if (expired) {
+      this.#dashboardNavigationOpen = false;
+      this.#devicePanelOpen = false;
+    }
+    rebuildPreservingView(this.root, () => {
+      this.#overlays.replaceChildren(...(!expired && snapshot && this.#devicePanelOpen ? [this.#devicePanel()] : []));
+      this.root.replaceChildren(
+        element("div", { className: "shell" },
+          expired
+            ? element("div", { className: "dashboard loading-dashboard" }, this.#accessScreen())
+            : snapshot
+              ? this.#dashboardLayout(snapshot)
+              : element("div", { className: "dashboard loading-dashboard" }, this.#connecting()),
+          this.#overlays,
+        ),
+      );
+    });
+    const layout = this.root.querySelector<HTMLElement>(".dashboard-layout");
+    if (layout) layout.inert = this.#devicePanelOpen;
   }
 
   /** Update changed agent titles in place, leaving every other element as it is. */
@@ -159,17 +246,8 @@ export class WebApp {
       this.#terminal.updateTitles(paneIds);
       return;
     }
-    for (const paneId of paneIds) {
-      const pane = snapshot.workspaces
-        .flatMap((workspace) => workspace.tabs)
-        .flatMap((tab) => tab.panes)
-        .find((candidate) => candidate.pane_id === paneId);
-      if (!pane) continue;
-      const { title, titleAbsent } = agentCardTitle(pane);
-      for (const node of this.root.querySelectorAll<HTMLElement>(`[data-pane-title="${CSS.escape(paneId)}"]`)) {
-        if (node.textContent !== title) node.textContent = title;
-        node.classList.toggle("absent", titleAbsent);
-      }
+    if ((this.#desktopSidebars.matches || this.#dashboardNavigationOpen) && this.#session.state !== "expired") {
+      this.#dashboardPanes.update(this.#terminalPaneOptions(), undefined, this.#showShells);
     }
   }
 
@@ -223,7 +301,7 @@ export class WebApp {
       return;
     }
     // A ticket the bridge just rejected can never work again.
-    if (this.#sent.ticket) sessionStorage.removeItem(TICKET_KEY);
+    if (this.#sent.ticket) this.#tickets.clear(this.#sentTicket);
     this.#tabCode = code;
     this.#pairError = undefined;
     void this.start();
@@ -273,6 +351,8 @@ export class WebApp {
     });
     const savePublicUrl = button("Save address", "ghost device-url-save", () => void this.#setPublicUrl(publicUrl.value));
     savePublicUrl.disabled = this.#deviceLoading || !status;
+    const disconnectButton = button("Disconnect this browser", "ghost device-disconnect", () => void this.#disconnectBrowser());
+    disconnectButton.disabled = this.#deviceLoading || !status;
     const panel = element("section", { className: "device-panel", attrs: { role: "dialog", "aria-modal": "true", "aria-labelledby": "device-title" } },
       element("div", { className: "device-panel-head" },
         element("div", {},
@@ -296,8 +376,13 @@ export class WebApp {
         savePublicUrl,
       ),
       element("p", { className: "device-help", text: "Use your HTTPS tunnel address for phone links. Clear it to use this browser's address. This changes links only, not network exposure or origin permissions." }),
-      element("p", { className: "device-help", text: "Each device receives its own ticket. Pairing links work once and expire after five minutes." }),
+      element("p", { className: "device-help", text: "Pair each browser once. Access is remembered across tabs and browser restarts. "
+        + (this.#bridge.ready?.expires_at
+          ? `This browser's access expires at ${new Date(this.#bridge.ready.expires_at * 1000).toLocaleString()}. `
+          : "Access lasts until the bridge stops or this browser is revoked. ")
+        + "Pairing links expire after five minutes." }),
       this.#pairingUrl ? this.#pairingCard(this.#pairingUrl) : pairButton,
+      disconnectButton,
     );
     const overlay = element("div", {
       className: "device-overlay",
@@ -349,6 +434,22 @@ export class WebApp {
       if (this.#devicePanelOpen) this.#render();
     }
     if (failure) this.#showError(failure);
+  }
+
+  async #disconnectBrowser(): Promise<void> {
+    if (this.#deviceLoading || !confirm("Disconnect this browser in every tab? You'll need a new QR/code to reconnect. Other browsers and running terminals are not affected.")) return;
+    this.#deviceLoading = true;
+    const ticket = this.#sentTicket;
+    try {
+      await this.#bridge.request("web.devices.forget");
+      this.#tickets.clear(ticket);
+      location.reload();
+    } catch (error) {
+      this.#showError(error);
+    } finally {
+      this.#deviceLoading = false;
+      this.#render();
+    }
   }
 
   async #setDeviceLimit(limit: number): Promise<void> {
@@ -430,6 +531,16 @@ export class WebApp {
   #closeDevicePanel(): void {
     this.#devicePanelOpen = false;
     this.#render();
+    this.root.querySelector<HTMLButtonElement>(this.#desktopSidebars.matches ? '[data-view-key="mission-nav:devices"]' : '[aria-label="Open navigation"]')?.focus({ preventScroll: true });
+  }
+
+  #openDevicePanel(): void {
+    this.#dashboardNavigationOpen = false;
+    this.#terminal?.closeNavigation();
+    this.#devicePanelOpen = true;
+    this.#render();
+    this.#overlays.querySelector<HTMLButtonElement>(".device-close")?.focus({ preventScroll: true });
+    void this.#refreshDevices();
   }
 
   #openSessionPanel(): void {
@@ -506,15 +617,10 @@ export class WebApp {
     );
   }
 
-  #missionDock(interactive = true): HTMLElement {
-    return element("nav", { className: "mission-dock", attrs: { "aria-label": "Mission control sections" } },
-      missionNavButton("Overview", "luvus", () => window.scrollTo({ top: 0, behavior: "smooth" }), true),
-      missionNavButton("Workspaces", "workspaces", () => document.querySelector("#mission-workspaces")?.scrollIntoView({ behavior: "smooth", block: "start" }), false, !interactive),
-      missionNavButton("Devices", "devices", () => {
-        this.#devicePanelOpen = true;
-        this.#render();
-        void this.#refreshDevices();
-      }, false, !interactive),
+  #sidebarFooter(): HTMLElement {
+    return element("nav", { className: "mission-dock", attrs: { "aria-label": "Devices and connection" } },
+      missionNavButton("Devices", "devices", () => this.#openDevicePanel()),
+      refreshButton(this.#sidebarControls.refresh),
       element("span", {
         className: `mission-nav-status ${this.#session.state}`,
         attrs: { role: "status", "aria-label": `Connection ${this.#session.state}`, title: this.#session.state },
@@ -522,51 +628,68 @@ export class WebApp {
     );
   }
 
+  #updateConnectionStatus(): void {
+    for (const status of this.root.querySelectorAll<HTMLElement>(".mission-nav-status")) {
+      status.className = `mission-nav-status ${this.#session.state}`;
+      status.setAttribute("aria-label", `Connection ${this.#session.state}`);
+      status.title = this.#session.state;
+    }
+  }
+
+  #openDashboardNavigation(): void {
+    if (this.#terminal || this.#desktopSidebars.matches || !this.#session.snapshot || this.#session.state === "expired") return;
+    this.#dashboardNavigationOpen = true;
+    this.#sessionPanelOpen = false;
+    this.#render();
+    this.#dashboardCloseButton.focus({ preventScroll: true });
+  }
+
+  #closeDashboardNavigation(restoreFocus = false): void {
+    if (!this.#dashboardNavigationOpen) return;
+    this.#dashboardNavigationOpen = false;
+    this.#render();
+    if (restoreFocus && !this.#desktopSidebars.matches) this.#dashboardOpenButton.focus({ preventScroll: true });
+  }
+
+  #dashboardLayout(snapshot: SessionSnapshot): HTMLElement {
+    const desktop = this.#desktopSidebars.matches;
+    const navigationVisible = desktop || this.#dashboardNavigationOpen;
+    const selected = this.#workspaceSelection.resolve(snapshot);
+    this.#dashboardWorkspaces.update(navigationVisible ? terminalWorkspaceOptions(snapshot, selected?.pane) : []);
+    this.#dashboardWorkspaces.setFooter(this.#sidebarFooter());
+    this.#dashboardWorkspaces.setCollapsed(this.#sidebarControls.collapsed.workspaces);
+    this.#dashboardPanes.update(navigationVisible ? this.#terminalPaneOptions() : [], undefined, this.#showShells);
+    this.#dashboardPanes.setCollapsed(this.#sidebarControls.collapsed.panes);
+    const { workspaces, panes } = this.#sidebarControls.collapsed;
+    if (this.#dashboardNavigationOpen) {
+      this.#dashboardNavigation.setAttribute("role", "dialog");
+      this.#dashboardNavigation.setAttribute("aria-modal", "true");
+    } else {
+      this.#dashboardNavigation.removeAttribute("role");
+      this.#dashboardNavigation.removeAttribute("aria-modal");
+    }
+    this.#dashboardOpenButton.setAttribute("aria-expanded", String(this.#dashboardNavigationOpen));
+    this.#dashboardHeader.inert = this.#dashboardNavigationOpen;
+    const dashboard = this.#dashboard(snapshot);
+    dashboard.inert = this.#dashboardNavigationOpen;
+    const frame = element("div", { className: "web-content-frame" }, this.#dashboardHeader, dashboard);
+    // Reuse the same sidebar nodes beside the desktop frame and in the mobile drawer.
+    // Moving them preserves row identity, focus, and independent scroll state.
+    if (!desktop && this.#dashboardPanes.root.parentElement !== this.#dashboardNavigation) this.#dashboardNavigation.append(this.#dashboardPanes.root);
+    return element("div", { className: `dashboard-layout${workspaces ? " workspaces-collapsed" : ""}${panes ? " panes-collapsed" : ""}${this.#dashboardNavigationOpen ? " pane-navigation-open" : ""}` },
+      this.#dashboardNavigation, frame, desktop ? this.#dashboardPanes.root : undefined,
+    );
+  }
+
   #dashboard(snapshot: SessionSnapshot): HTMLElement {
-    const { agentCount, workingCount, cards } = dashboardAgents(snapshot, this.#showShells);
+    const agents = snapshot.workspaces.flatMap((workspace) => workspace.tabs.flatMap((tab) => tab.panes))
+      .filter((pane) => pane.kind === "terminal" && pane.is_agent === true);
+    const agentCount = agents.length;
+    const workingCount = agents.filter((pane) => pane.agent_status === "working").length;
     const tabCount = snapshot.workspaces.reduce((total, workspace) => total + workspace.tabs.length, 0);
     const paneCount = snapshot.workspaces.reduce((total, workspace) => total
       + workspace.tabs.reduce((tabTotal, tab) => tabTotal + tab.panes.length, 0), 0);
-    const workspaces = snapshot.workspaces.map((workspace, workspaceIndex) => {
-      const workspaceName = displayText(workspace.name, `Workspace ${workspaceIndex + 1}`);
-      const workspacePath = displayText(workspace.cwd, "Path unavailable");
-      const branch = displayText(workspace.branch, "");
-      return element("article", { className: `workspace-card${workspace.active ? " active" : ""}` },
-        element("header", { className: "workspace-head" },
-          element("div", { className: "workspace-title" },
-            element("div", { className: "workspace-name-row" },
-              element("span", { className: `workspace-presence${workspace.active ? " active" : ""}`, attrs: { "aria-label": workspace.active ? "Active workspace" : "Workspace" } }),
-              element("h3", { text: workspaceName }),
-              branch ? element("span", { className: "workspace-branch", text: branch }) : undefined,
-            ),
-            element("p", { text: workspacePath }),
-          ),
-          element("span", { className: "workspace-tab-total", text: `${workspace.tabs.length} tab${workspace.tabs.length === 1 ? "" : "s"}` }),
-        ),
-        element("div", { className: "workspace-tabs" },
-          ...workspace.tabs.map((tab, tabIndex) => {
-            const tabName = displayText(tab.name, `Tab ${tabIndex + 1}`);
-            return element("section", { className: `workspace-tab${tab.active ? " active" : ""}` },
-              element("div", { className: "workspace-tab-head" },
-                element("span", { className: "tab-presence", attrs: { "aria-hidden": "true" } }),
-                element("strong", { text: tabName }),
-                element("span", {
-                  className: "tab-pane-total",
-                  text: String(tab.panes.length),
-                  attrs: { "aria-label": `${tab.panes.length} pane${tab.panes.length === 1 ? "" : "s"}` },
-                }),
-              ),
-              element("div", { className: "pane-grid" }, ...tab.panes.map((pane, paneIndex) => this.#paneButton(snapshot, pane, paneIndex))),
-            );
-          }),
-          workspace.tabs.length === 0
-            ? element("p", { className: "workspace-empty", text: "No tabs in this workspace" })
-            : undefined,
-        ),
-      );
-    });
-    return element("div", { className: "dashboard" },
-      this.#missionDock(),
+    return element("div", { className: "dashboard", attrs: { "data-scroll-key": "dashboard-main" } },
       element("section", { className: "mission-hero", attrs: { id: "mission-overview" } },
         element("div", { className: "hero-layout" },
           element("div", { className: "hero-stat-column stats-left" },
@@ -602,70 +725,7 @@ export class WebApp {
             missionStat(String(agentCount).padStart(2, "0"), "Agents"),
           ),
         ),
-        button("Refresh telemetry", "ghost hero-refresh", () => void this.#session.refresh().catch((error) => this.#showError(error))),
       ),
-      element("section", { className: "section" },
-        element("div", { className: "section-heading", attrs: { id: "mission-agents" } },
-          element("h2", { className: "section-title", text: "Agents" }),
-          element("div", { className: "agent-filters", attrs: { role: "group", "aria-label": "Filter agents" } },
-            ...[false, true].map((showShells) => element("button", {
-              className: "agent-filter",
-              text: showShells ? "All panes" : "Active agents",
-              attrs: { type: "button", "aria-pressed": String(this.#showShells === showShells), title: showShells ? "Include shell panes" : "Show detected agents, including idle and waiting agents" },
-              on: { click: () => {
-                this.#showShells = showShells;
-                this.#render();
-                this.root.querySelector<HTMLButtonElement>('.agent-filter[aria-pressed="true"]')?.focus();
-              } },
-            })),
-          ),
-        ),
-        element("div", { className: "agent-grid" }, ...cards.map(({ pane, context, title, state, titleAbsent, available }) => element("button", {
-          className: "agent-card",
-          attrs: { type: "button", "data-view-key": `agent:${pane.pane_id}`, ...(available ? {} : { disabled: "", title: "Terminal unavailable" }) },
-          on: { click: () => { if (available) this.#openTerminal(snapshot, pane); } },
-        },
-        element("div", { className: "agent-copy" },
-          element("small", { className: "agent-context", text: context }),
-          element("strong", { className: `agent-session-title${titleAbsent ? " absent" : ""}`, text: title, attrs: { "data-pane-title": pane.pane_id } }),
-        ),
-        element("span", { className: `agent-state ${available ? paneStateClass(state) : "terminal"}`, text: available ? state : "Terminal unavailable" }),
-        available ? missionIcon("arrow") : undefined,
-        ))),
-        cards.length === 0 ? element("p", { className: "workspace-empty", text: this.#showShells ? "No terminal panes in this session." : "No active agents. Choose All panes to show shells." }) : undefined,
-      ),
-      element("section", { className: "section" },
-        element("div", { className: "section-heading", attrs: { id: "mission-workspaces" } },
-          element("h2", { className: "section-title", text: "Workspaces" }),
-          element("span", { className: "section-status", text: `${snapshot.workspaces.length} connected` }),
-        ),
-        element("div", { className: "workspace-grid" }, ...workspaces),
-      ),
-    );
-  }
-
-  #paneButton(snapshot: SessionSnapshot, pane: PaneSnapshot, paneIndex: number): HTMLElement {
-    if (pane.kind !== "terminal" || !pane.terminal_id) return element("span", { className: "pane-tile view" },
-      element("span", { className: "pane-presence" }),
-      element("span", { className: "pane-copy" },
-        element("strong", { text: "View" }),
-        element("small", { text: "Native pane" }),
-      ),
-    );
-    const agent = displayText(pane.agent_name, displayText(pane.agent, ""));
-    const state = displayText(pane.agent_status, agent ? "Agent" : "Shell");
-    const stateClass = paneStateClass(state);
-    return element("button", {
-      className: `pane-tile ${stateClass}${pane.focused ? " focused" : ""}`,
-      attrs: { type: "button", "data-view-key": `pane:${pane.pane_id}` },
-      on: { click: () => this.#openTerminal(snapshot, pane) },
-    },
-    element("span", { className: "pane-presence" }),
-    element("span", { className: "pane-copy" },
-      element("strong", { text: agent || `Terminal ${paneIndex + 1}` }),
-      element("small", { text: state }),
-    ),
-    missionIcon("arrow"),
     );
   }
 
@@ -673,6 +733,9 @@ export class WebApp {
     const allowed = this.#session.allowedMethods;
     const control = allowed.has("terminal.backend.control");
     if (!control && !allowed.has("terminal.backend.observe")) return;
+    this.#dashboardNavigationOpen = false;
+    this.#workspaceSelection.select(snapshot, pane);
+    this.#paneRecency.opened(snapshot, pane);
     this.#terminal?.destroy();
     const streamCursor = this.#session.capabilities?.terminal?.features?.includes("stream_cursor") ?? false;
     const canUploadFiles = control && supportsFileUpload(
@@ -697,15 +760,17 @@ export class WebApp {
         this.#terminal = undefined;
         this.#render();
       },
+      { showShells: this.#showShells, onChange: (showShells) => { this.#showShells = showShells; } },
+      this.#sidebarControls,
     );
     this.#terminal = terminal;
-    this.root.replaceChildren(terminal.root);
+    this.root.replaceChildren(terminal.root, this.#overlays);
     void terminal.start().catch((error) => this.#showError(error));
   }
 
   #terminalPaneOptions(): TerminalPaneOption[] {
     const snapshot = this.#session.snapshot;
-    return snapshot ? terminalPaneOptions(snapshot) : [];
+    return snapshot ? filterWorkspacePanes(this.#paneRecency.options(snapshot), this.#workspaceSelection.resolve(snapshot)?.workspace) : [];
   }
 
   #showError(error: unknown): void {
@@ -766,18 +831,13 @@ function asBrowserSessions(value: unknown): BrowserSession[] {
   });
 }
 
-function paneStateClass(state: string): string {
-  const normalized = state.toLowerCase();
-  return ["working", "blocked", "done", "idle"].includes(normalized) ? normalized : "terminal";
-}
-
 type MissionIconName = "overview" | "workspaces" | "devices" | "status" | "arrow";
 type MissionNavIconName = MissionIconName | "luvus";
 
 function missionNavButton(label: string, icon: MissionNavIconName, onClick: () => void, active = false, disabled = false): HTMLButtonElement {
   const control = element("button", {
     className: `mission-nav-button${icon === "luvus" ? " logo" : ""}${active ? " active" : ""}`,
-    attrs: { type: "button", "aria-label": label, title: label, ...(disabled ? { disabled: "" } : {}) },
+    attrs: { type: "button", "aria-label": label, title: label, "data-view-key": `mission-nav:${icon}`, ...(disabled ? { disabled: "" } : {}) },
     on: { click: onClick },
   }, icon === "luvus"
     ? element("img", { className: "mission-nav-logo", attrs: { src: "/mark.svg", alt: "" } })
