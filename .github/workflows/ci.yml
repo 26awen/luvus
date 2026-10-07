@@ -75,6 +75,7 @@ jobs:
           npm --prefix web test
           npm --prefix web run test:integration
           LUVUS_BIN="$PWD/target/debug/luvus" npm --prefix web run test:native
+          LUVUS_BIN="$PWD/target/debug/luvus" LUVUS_BROWSER_BIN=/usr/bin/google-chrome npm --prefix web run test:browser-pairing
       - name: Validate terminal backend contract
         run: |
           python3 examples/uhp/terminal/consumer.py --fixtures
